@@ -1,0 +1,3 @@
+[submodule "child_repo_10_LOC"]
+	path = child_repo_10_LOC
+	url = https://github.com/lakshya-blitzy/child_repo_10_LOC.git
