@@ -1,0 +1,16 @@
+{
+  "name": "parent_repo_10_LOC",
+  "version": "1.0.0",
+  "description": "Apex (Level 1) JavaScript application of the parent_repo_10_LOC submodule composition; serves a machine-readable /health endpoint using only the Node.js standard library.",
+  "private": true,
+  "license": "UNLICENSED",
+  "main": "index.js",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test",
+    "check": "node --check index.js && node --check health.js && node --check server.js && node --check index.test.js"
+  }
+}
