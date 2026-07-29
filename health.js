@@ -209,11 +209,50 @@ const STATUS_METHOD_NOT_ALLOWED = 405;
 
 // Error bodies, pre-serialized once because they never vary. Both share the
 // single-member `{"error":"<reason phrase>"}` shape and the same compact
-// separators as the success body. There is deliberately no third body: the
-// contract's vocabulary is `200`, `405` and `404`, so no other status is ever
-// written.
+// separators as the success body. There is deliberately no third *routed* body:
+// the contract's vocabulary is `200`, `405` and `404`, so no other status is ever
+// written for a request that reaches the router.
 const NOT_FOUND_BODY = JSON.stringify({ error: 'Not Found' });
 const METHOD_NOT_ALLOWED_BODY = JSON.stringify({ error: 'Method Not Allowed' });
+
+// The protocol-level status codes. These are NOT contract codes: they answer
+// requests the HTTP parser refuses before routing is possible at all, which is a
+// different population from the routed responses above. They exist here so that
+// such a refusal still leaves a machine-readable answer on the wire instead of a
+// bodyless status line or, worse, silence — see {@link handleClientError}. Level 2
+// shapes the same population identically through `error_message_format`, so the
+// three tiers agree on protocol errors as well as on routed ones.
+const STATUS_BAD_REQUEST = 400;
+const STATUS_REQUEST_TIMEOUT = 408;
+const STATUS_HEADERS_TOO_LARGE = 431;
+
+/**
+ * Characters RFC 9110 §5.6.2 permits in a `token`, and therefore in a method name.
+ *
+ * This is the discriminator between the two populations of request line the HTTP
+ * parser refuses with the same error code: a well-formed but unrecognised *method*
+ * (`FROBNICATE`, lowercase `get`) — which the contract answers `405` — and a
+ * genuinely malformed *request line* (a tab where the single space belongs) —
+ * which is a `400`. Without it both would collapse onto one answer, and one of the
+ * two would be wrong.
+ *
+ * @type {RegExp}
+ */
+const METHOD_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+
+/** Single space: the only delimiter RFC 9112 §3 permits inside a request line. */
+const REQUEST_LINE_DELIMITER = ' ';
+
+/**
+ * Upper bound on how much of a refused request line is inspected.
+ *
+ * A method token longer than this is not a method token, and reading further into
+ * a hostile packet buys nothing. Bounded on purpose: the value inspected here came
+ * off the wire from an unauthenticated peer.
+ *
+ * @type {number}
+ */
+const MAX_METHOD_TOKEN_LENGTH = 64;
 
 /**
  * First character of an origin-form request target (RFC 9112, §3.2.1).
@@ -1276,7 +1315,22 @@ function finalizeAfterUnexpectedError(res, error) {
 }
 
 /**
- * `node:http` request listener implementing the complete `/health` contract.
+ * Applies the contract's routing rule and returns the response to be written.
+ *
+ * The single source of the routing decision at this tier. It is a **pure**
+ * function of the method and the raw request target — it reads the clock and the
+ * already-resolved configuration, and touches nothing else — which is what lets
+ * the same rule serve both response paths this module has:
+ *
+ *   - {@link handleRequest}, the ordinary `node:http` request listener, which
+ *     writes the outcome through a `ServerResponse`; and
+ *   - the socket-level listeners {@link handleConnect} and {@link handleUpgrade},
+ *     which are handed a bare socket by the runtime and write the same outcome
+ *     through {@link writeRawResponse}.
+ *
+ * Two paths, one rule, deliberately: duplicating the method-then-path decision in
+ * the socket-level handlers is precisely how a second, undocumented routing
+ * behaviour would appear on the same port.
  *
  * Routing order is normative, not incidental:
  *
@@ -1285,12 +1339,54 @@ function finalizeAfterUnexpectedError(res, error) {
  *      the most actionable fact first: that its method is not permitted anywhere
  *      on this server.
  *   2. **Then the raw origin-form path, compared for exact equality against the
- *      frozen path.** A query string is ignored; nothing else is. A trailing
- *      slash is not normalized, a dot segment is not resolved, a percent-encoded
- *      byte is not decoded and an absolute-form target is not accepted — so
- *      `/health?x=1` matches while `/health/`, `/other/../health`,
- *      `/%2e%2e/health`, `/health#x` and `http://host/health` are each a `404`.
+ *      frozen path.** A query string is ignored; nothing else is. See
+ *      {@link requestTargetPath}.
  *   3. **Then success**, with a freshly built, compactly serialized payload.
+ *
+ * Method names are compared case-insensitively as a defensive measure for direct
+ * invocation by unit tests; over the wire Node's HTTP parser only ever surfaces
+ * canonical uppercase method tokens.
+ *
+ * @param {string|undefined} method The request method, as the runtime reports it.
+ * @param {string|undefined} requestTarget The raw request target, verbatim.
+ * @returns {{statusCode: number, json: string, omitBody: boolean, extraHeaders: (Object|null)}}
+ *   The complete response the contract prescribes for this method and target.
+ */
+function resolveContractResponse(method, requestTarget) {
+  const normalized = typeof method === 'string' ? method.toUpperCase() : '';
+  const omitBody = normalized === 'HEAD';
+
+  if (!ALLOWED_METHODS.includes(normalized)) {
+    // 405 is never the answer to a HEAD request, since HEAD is allowed, so the
+    // body is always written here.
+    return {
+      statusCode: STATUS_METHOD_NOT_ALLOWED,
+      json: METHOD_NOT_ALLOWED_BODY,
+      omitBody: false,
+      extraHeaders: { Allow: ALLOW_HEADER_VALUE },
+    };
+  }
+
+  if (requestTargetPath(requestTarget) !== config.path) {
+    return { statusCode: STATUS_NOT_FOUND, json: NOT_FOUND_BODY, omitBody, extraHeaders: null };
+  }
+
+  return {
+    statusCode: STATUS_OK,
+    json: JSON.stringify(buildHealthPayload()),
+    omitBody,
+    extraHeaders: null,
+  };
+}
+
+
+/**
+ * `node:http` request listener implementing the complete `/health` contract.
+ *
+ * The routing decision itself lives in {@link resolveContractResponse}, which this
+ * listener shares with the socket-level handlers, and the normative order —
+ * method first, then the raw origin-form path, then success — is documented there.
+ * All this function adds is the `ServerResponse` write and the guarantee below.
  *
  * The handler performs no file I/O, no network call and no dependency
  * interrogation: reading an already-loaded value and reading the clock is its
@@ -1302,37 +1398,10 @@ function finalizeAfterUnexpectedError(res, error) {
  * failure emits one sanitized line the first time each distinct category occurs
  * (see {@link finalizeAfterUnexpectedError}), so a real defect cannot hide inside
  * the silence that per-request quiet requires.
- *
- * Method names are compared case-insensitively as a defensive measure for direct
- * invocation by unit tests; over the wire Node's HTTP parser only ever surfaces
- * canonical uppercase method tokens.
  */
 function handleRequest(req, res) {
   try {
-    const method = typeof req.method === 'string' ? req.method.toUpperCase() : '';
-    const omitBody = method === 'HEAD';
-
-    if (!ALLOWED_METHODS.includes(method)) {
-      // 405 is never the answer to a HEAD request, since HEAD is allowed, so the
-      // body is always written here.
-      writeJsonResponse(res, {
-        statusCode: STATUS_METHOD_NOT_ALLOWED,
-        json: METHOD_NOT_ALLOWED_BODY,
-        extraHeaders: { Allow: ALLOW_HEADER_VALUE },
-      });
-      return;
-    }
-
-    if (requestTargetPath(req.url) !== config.path) {
-      writeJsonResponse(res, { statusCode: STATUS_NOT_FOUND, json: NOT_FOUND_BODY, omitBody });
-      return;
-    }
-
-    writeJsonResponse(res, {
-      statusCode: STATUS_OK,
-      json: JSON.stringify(buildHealthPayload()),
-      omitBody,
-    });
+    writeJsonResponse(res, resolveContractResponse(req.method, req.url));
   } catch (error) {
     // Two distinct populations arrive here and must not be conflated: a peer that
     // hung up mid-write (routine, silent) and a defect in the code above (rare,
@@ -1344,15 +1413,293 @@ function handleRequest(req, res) {
 }
 
 /**
+ * Writes one complete response directly onto a socket, in a single write.
+ *
+ * The socket-level counterpart of {@link writeJsonResponse}, and it exists because
+ * `node:http` hands three of its events a **bare socket** rather than a
+ * `ServerResponse`: `'connect'`, `'upgrade'` and `'clientError'`. There is no
+ * response object to write through on those paths, so the status line and the
+ * contract headers are assembled here — from the same constants the routed
+ * responses use, never from retyped literals, so the two paths cannot drift.
+ *
+ * Three properties are deliberate:
+ *
+ *   - **One write.** The status line, the header block and the body are
+ *     concatenated and written once, so the response leaves in a single segment.
+ *   - **`Connection: close`.** Every request that reaches this function was
+ *     refused at or below the protocol layer, so the connection's framing can no
+ *     longer be trusted for reuse. Closing is the only safe framing, and it is
+ *     what the runtime would have done anyway.
+ *   - **Reason phrases from `http.STATUS_CODES`.** The runtime's own table, so a
+ *     status line is never hand-spelled.
+ *
+ * The header order matches {@link writeJsonResponse}: caller-supplied headers
+ * (only ever `Allow`) first, then the contract headers, so a caller can add but
+ * never override.
+ *
+ * It never throws. A socket refused at the protocol layer may already be gone, and
+ * an exception escaping an event handler would take the process with it — which
+ * would turn a malformed request from one client into an outage for every client.
+ *
+ * @param {import('node:net').Socket} socket The socket to answer on.
+ * @param {{statusCode: number, json: string, omitBody?: boolean, extraHeaders?: (Object|null)}} outcome
+ *   The response to write, in the shape {@link resolveContractResponse} returns.
+ * @returns {boolean} `true` when the response was written, `false` when the socket
+ *   was unusable and was destroyed instead.
+ */
+function writeRawResponse(socket, outcome) {
+  // A socket that is gone, or that has already had bytes written to it, must not be
+  // written to again: appending a second status line to a response already in
+  // flight would corrupt the stream the peer is parsing. This is the same rule
+  // `node:http` applies before writing its own error responses.
+  if (!socket || socket.destroyed === true || socket.writable !== true || socket.bytesWritten !== 0) {
+    destroySocket(socket);
+    return false;
+  }
+
+  try {
+    const { statusCode, json, omitBody = false, extraHeaders = null } = outcome;
+    const body = Buffer.from(json, 'utf8');
+    const fields = [`HTTP/1.1 ${statusCode} ${http.STATUS_CODES[statusCode]}`];
+
+    if (extraHeaders !== null) {
+      for (const [name, value] of Object.entries(extraHeaders)) {
+        fields.push(`${name}: ${value}`);
+      }
+    }
+
+    // `Content-Length` is the byte length the body *would* have even when the body
+    // is withheld, exactly as on the routed path, so a `HEAD`-shaped answer still
+    // reports an accurate length.
+    fields.push(`Content-Type: ${CONTENT_TYPE}`);
+    fields.push(`Cache-Control: ${CACHE_CONTROL}`);
+    fields.push(`Content-Length: ${body.length}`);
+    fields.push('Connection: close');
+    fields.push('', '');
+
+    const head = Buffer.from(fields.join('\r\n'), 'latin1');
+    socket.end(omitBody ? head : Buffer.concat([head, body]));
+    return true;
+  } catch (error) {
+    // The socket went away underneath the write. That is the peer's business, not a
+    // defect here, so it is classified and reported by the same bounded, sanitized
+    // route every other unexpected failure takes.
+    const category = classifyHandlerFailure(error);
+    if (category !== null) {
+      reportHandlerFailure(category, OUTCOME_NO_RESPONSE);
+    }
+    destroySocket(socket);
+    return false;
+  }
+}
+
+/**
+ * Closes a socket without writing to it, tolerating one that is already gone.
+ *
+ * Used when a response cannot honestly be written: the peer then observes a
+ * transport failure, which is what actually happened, rather than a status this
+ * process could not deliver.
+ *
+ * @param {import('node:net').Socket|null|undefined} socket The socket to close.
+ */
+function destroySocket(socket) {
+  try {
+    if (socket && socket.destroyed !== true && typeof socket.destroy === 'function') {
+      socket.destroy();
+    }
+  } catch {
+    // Nothing further is possible or needed: the socket is unusable either way.
+  }
+}
+
+/**
+ * Answers a `CONNECT` request with the contract's `405`.
+ *
+ * `CONNECT` never reaches a request listener. `node:http` routes it to the
+ * `'connect'` event, and a server with no listener for that event **destroys the
+ * socket without writing anything at all** — the client gets silence, waits for its
+ * own timeout, and learns nothing. That silence was the observed defect this
+ * handler removes.
+ *
+ * `405` is the correct answer rather than an approximation: `CONNECT` is a
+ * perfectly well-formed method token, it is simply not one of the two the contract
+ * permits, and the contract says every other method is answered `405` with
+ * `Allow: GET, HEAD`. It is also what the Level 2 and Level 3 siblings already
+ * answer for the same request, so this restores the cross-tier uniformity the
+ * contract exists to guarantee.
+ *
+ * The path is deliberately not consulted. A `CONNECT` target is authority-form (or
+ * anything else a caller writes), and the contract evaluates the method before the
+ * path, so the answer cannot depend on it.
+ *
+ * @param {import('node:http').IncomingMessage} _req The tunnel request. Unused: the
+ *   method alone decides the answer.
+ * @param {import('node:net').Socket} socket The socket the runtime detached.
+ */
+function handleConnect(_req, socket) {
+  writeRawResponse(socket, {
+    statusCode: STATUS_METHOD_NOT_ALLOWED,
+    json: METHOD_NOT_ALLOWED_BODY,
+    extraHeaders: { Allow: ALLOW_HEADER_VALUE },
+  });
+}
+
+/**
+ * Answers a protocol upgrade request as the ordinary request it also is.
+ *
+ * A request carrying `Upgrade:` with `Connection: Upgrade` is routed by
+ * `node:http` to the `'upgrade'` event, and — exactly as with `'connect'` — a
+ * server with no listener destroys the socket unanswered. The same silence, from
+ * the same cause.
+ *
+ * The answer here is the one the contract already prescribes for the request
+ * underneath the upgrade offer: this server supports no upgrade protocol, so it
+ * declines to switch and answers the request as sent. `GET /health` with an
+ * `Upgrade` header is therefore a normal `200`, which is what the Level 2 and
+ * Level 3 siblings answer for the same bytes — they have no notion of an upgrade
+ * at all. `101 Switching Protocols` is never sent, and no other status is
+ * invented: {@link resolveContractResponse} decides, so the upgrade path cannot
+ * develop a routing rule of its own.
+ *
+ * @param {import('node:http').IncomingMessage} req The request that offered the upgrade.
+ * @param {import('node:net').Socket} socket The socket the runtime detached.
+ */
+function handleUpgrade(req, socket) {
+  writeRawResponse(socket, resolveContractResponse(req.method, req.url));
+}
+
+/**
+ * Reads the method token out of a request line the parser refused.
+ *
+ * `error.rawPacket` carries the bytes as they arrived, which is the only place the
+ * refused method survives — the parser rejected the line, so no `IncomingMessage`
+ * was ever built. The token is everything before the first character RFC 9110
+ * §5.6.2 does not permit in one, and it is read within a bound because an
+ * unauthenticated peer chose the content.
+ *
+ * @param {Buffer|undefined} rawPacket The bytes of the refused request, if the
+ *   runtime supplied them.
+ * @returns {string|null} The method token when the request line is well formed
+ *   apart from the token's *value* — that is, a non-empty token followed by the
+ *   single space RFC 9112 §3 requires — and `null` for anything else, including an
+ *   absent packet and a line whose delimiter is not a space.
+ */
+function refusedMethodToken(rawPacket) {
+  if (!Buffer.isBuffer(rawPacket) || rawPacket.length === 0) {
+    return null;
+  }
+
+  const prefix = rawPacket.subarray(0, MAX_METHOD_TOKEN_LENGTH + 1).toString('latin1');
+  const delimiterAt = prefix.indexOf(REQUEST_LINE_DELIMITER);
+
+  if (delimiterAt <= 0 || delimiterAt > MAX_METHOD_TOKEN_LENGTH) {
+    return null;
+  }
+
+  const token = prefix.slice(0, delimiterAt);
+  return METHOD_TOKEN.test(token) ? token : null;
+}
+
+/**
+ * Answers a request the HTTP parser refused, so that a refusal is never silent.
+ *
+ * `node:http` emits `'clientError'` for a request its parser could not accept, and
+ * its own default answer is a **bodyless** `HTTP/1.1 400 Bad Request` — no
+ * `Content-Type`, no `Allow`, nothing a JSON consumer can read. For one population
+ * of refused request that default is also the *wrong status*, which is the defect
+ * this handler fixes.
+ *
+ * The refusals are separated by cause, because they are genuinely different
+ * conditions and the correct answer differs:
+ *
+ *   - **A well-formed but unrecognised method token** (`FROBNICATE`, or a
+ *     lowercase `get`, which the parser's table does not contain) is answered with
+ *     the contract's `405` and `Allow: GET, HEAD`. The contract says every method
+ *     other than `GET` and `HEAD` is answered `405`, and it draws no distinction
+ *     between a method the parser happens to know and one it does not — the Level 2
+ *     and Level 3 siblings answer `405` for both, so answering `400` here was the
+ *     one place the three tiers disagreed on a case the contract covers.
+ *   - **A malformed request line** — anything else the parser rejected, including a
+ *     tab where RFC 9112 §3 requires a single space — is a `400`. The method token
+ *     is not the problem there, and claiming "method not allowed" about a line that
+ *     could not be parsed would misdirect whoever reads it.
+ *     {@link refusedMethodToken} is what tells the two apart.
+ *   - **An oversized header block** is a `431`, and **a request that never
+ *     completed within the runtime's timeout** is a `408`. Both are the RFC-correct
+ *     answers for their condition, and both preserve the status `node:http` itself
+ *     would have sent, so attaching this handler changes the code for exactly one
+ *     population and no others.
+ *
+ * Every answer carries the contract's own headers and a single-member JSON body
+ * built from the runtime's reason phrase, which is the same shape Level 2 gives
+ * the same population through its `error_message_format`.
+ *
+ * A refusal is never reported to the log. These requests arrive unauthenticated
+ * and unsolicited, so a line per refusal would hand any peer a way to fill the log
+ * of a process whose silence is a requirement.
+ *
+ * @param {NodeJS.ErrnoException & {rawPacket?: Buffer}} error The parser's error.
+ * @param {import('node:net').Socket} socket The socket the request arrived on.
+ */
+function handleClientError(error, socket) {
+  const code = error !== null && typeof error === 'object' && typeof error.code === 'string' ? error.code : '';
+
+  // The peer is already gone, so there is nothing to answer and nothing to report.
+  if (code === 'ECONNRESET') {
+    destroySocket(socket);
+    return;
+  }
+
+  if (code === 'HPE_INVALID_METHOD' && refusedMethodToken(error.rawPacket) !== null) {
+    writeRawResponse(socket, {
+      statusCode: STATUS_METHOD_NOT_ALLOWED,
+      json: METHOD_NOT_ALLOWED_BODY,
+      extraHeaders: { Allow: ALLOW_HEADER_VALUE },
+    });
+    return;
+  }
+
+  const statusCode = code === 'HPE_HEADER_OVERFLOW'
+    ? STATUS_HEADERS_TOO_LARGE
+    : (code === 'ERR_HTTP_REQUEST_TIMEOUT' ? STATUS_REQUEST_TIMEOUT : STATUS_BAD_REQUEST);
+
+  writeRawResponse(socket, {
+    statusCode,
+    json: JSON.stringify({ error: http.STATUS_CODES[statusCode] }),
+  });
+}
+
+/**
  * Creates an **unbound** HTTP server: nothing here listens on a port.
  *
  * Binding is `server.js`'s responsibility, along with the process lifecycle, the
  * start-up log line and the signal handlers. Keeping `listen` out of this module
  * is what lets the unit suite require it, assert the contract and exit
  * immediately without ever opening a socket.
+ *
+ * Four listeners, not one, and the three beyond the request listener are what stop
+ * a request from being answered with silence. `node:http` routes `CONNECT` to
+ * `'connect'`, an upgrade offer to `'upgrade'`, and a request its parser refused to
+ * `'clientError'`; with no listener attached, the first two are **destroyed
+ * unanswered** and the third gets a bodyless status line the contract does not
+ * describe. Every listener is attached here rather than in `server.js` so that the
+ * suite — which builds its servers through this factory — exercises the same
+ * wiring the entry point runs, and so that the shape of a response stays the
+ * responsibility of the module that owns the contract.
+ *
+ * `'checkContinue'` is deliberately **not** handled: with no listener, `node:http`
+ * itself answers `100 Continue` and then emits the request normally, so an
+ * `Expect: 100-continue` request already reaches {@link handleRequest} and is
+ * already answered. There is no silence to remove there.
  */
 function createHealthServer() {
-  return http.createServer(handleRequest);
+  const server = http.createServer(handleRequest);
+
+  server.on('connect', handleConnect);
+  server.on('upgrade', handleUpgrade);
+  server.on('clientError', handleClientError);
+
+  return server;
 }
 
 /**
@@ -1386,7 +1733,17 @@ function createHealthServer() {
  * leaving an operator something to act on.
  *
  * `requestTargetPath` is exported so that the unit suite can assert the routing
- * decision directly, spelling by spelling, without binding a socket.
+ * decision directly, spelling by spelling, without binding a socket, and
+ * `resolveContractResponse` is exported for the same reason one level up: it is the
+ * whole routing rule — method, then path, then payload — as a pure function, so the
+ * decision both response paths share is assertable without a socket either.
+ *
+ * `handleConnect`, `handleUpgrade` and `handleClientError` are the three
+ * socket-level listeners `createHealthServer` attaches, exported so the suite can
+ * assert directly that each writes the frozen response and that none of them can
+ * throw. Every one of the three answers a request that `node:http` would otherwise
+ * leave unanswered or answer with a bodyless status line, so each needs to be
+ * assertable on its own rather than only through a live socket.
  *
  * `currentTimestamp` and `formatTimestamp` are exported so the freshness clause can
  * be asserted directly: the first proves that two immediate calls differ, and the
@@ -1402,8 +1759,12 @@ module.exports = {
   currentTimestamp,
   formatTimestamp,
   handleRequest,
+  handleConnect,
+  handleUpgrade,
+  handleClientError,
   createHealthServer,
   requestTargetPath,
+  resolveContractResponse,
   declaredStatus,
   config,
   configSources,

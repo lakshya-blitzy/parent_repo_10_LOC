@@ -171,6 +171,14 @@ const TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const NOT_FOUND_BODY = '{"error":"Not Found"}';
 const METHOD_NOT_ALLOWED_BODY = '{"error":"Method Not Allowed"}';
 
+// The two protocol-level refusal bodies. These answer requests the HTTP parser
+// rejected before routing was possible, which is a different population from the
+// routed responses above — but they carry the same single-member shape, so a
+// consumer parses every answer this server gives the same way. Written out here
+// rather than read back from the subject, like every other expectation in this file.
+const BAD_REQUEST_BODY = '{"error":"Bad Request"}';
+const HEADERS_TOO_LARGE_BODY = '{"error":"Request Header Fields Too Large"}';
+
 /**
  * Request targets and the path each one must yield, or `null` for no path at all.
  *
@@ -341,17 +349,46 @@ const REFUSED_METHODS = Object.freeze([
 ]);
 
 /**
- * Method tokens the runtime's parser refuses before any request listener runs.
+ * Well-formed method tokens the runtime's parser does not recognise.
  *
- * Node validates the method token against its own table and answers anything
+ * Node validates the method token against its own table and refuses anything
  * outside it — including a correctly spelled method in the wrong case, since
- * methods are case-sensitive — with `400 Bad Request` of its own making. That is a
- * boundary of the runtime, not a behaviour of this application, and it is asserted
- * for exactly what it guarantees: the endpoint is not served that way.
+ * methods are case-sensitive — before any request listener runs. Every token here
+ * is nevertheless a valid RFC 9110 §5.6.2 `token`, so the *request line* is well
+ * formed and only the method's value is unrecognised. The contract answers every
+ * method other than `GET` and `HEAD` with `405`, drawing no distinction between one
+ * the parser knows and one it does not, so all of these must be answered `405` with
+ * `Allow: GET, HEAD` — which is also what the Python and Java tiers answer for the
+ * same bytes.
+ *
+ * `CONNECT` belongs to this group by contract and not by mechanism: the runtime
+ * recognises it perfectly well and routes it to the `'connect'` event instead of a
+ * request listener, which is a different path to the same required answer. It is
+ * asserted separately, in both of its target forms.
  *
  * @type {ReadonlyArray<string>}
  */
-const UNPARSABLE_METHOD_TOKENS = Object.freeze(['FROBNICATE', 'get']);
+const UNKNOWN_METHOD_TOKENS = Object.freeze(['FROBNICATE', 'get']);
+
+/**
+ * Request lines that are malformed as *lines*, whatever method they name.
+ *
+ * RFC 9112 §3 fixes the request line as method, one space, target, one space,
+ * version. A tab in place of that first space makes the line unparseable, and the
+ * method token is not what is wrong with it — so the answer is `400`, not the
+ * contract's `405`, and asserting that keeps the two populations of parser refusal
+ * apart. Node reports both with the same error code, so a fix that answered them
+ * identically would be answering one of them wrongly.
+ *
+ * Written as complete request lines rather than a method and a target, because the
+ * defect being asserted *is* the delimiter.
+ *
+ * @type {ReadonlyArray<string>}
+ */
+const MALFORMED_REQUEST_LINES = Object.freeze([
+  `GET\t${HEALTH_PATH} HTTP/1.1`,
+  ` ${HEALTH_PATH} HTTP/1.1`,
+]);
 
 /** Line terminator the protocol requires between the request line and each field. */
 const CRLF = '\r\n';
@@ -361,6 +398,22 @@ const HEAD_BODY_SEPARATOR = CRLF + CRLF;
 
 /** Upper bound on a hand-written exchange, so a lost response fails rather than hangs. */
 const RAW_SOCKET_TIMEOUT_MS = 5000;
+
+/**
+ * Sequential requests issued on one persistent connection, and the budget for them.
+ *
+ * The contract requires each response to leave in a single write, and the budget is
+ * sized against the cost of missing that requirement rather than for comfort: the
+ * sibling Python tier, writing head and body separately onto an unbuffered socket with
+ * Nagle's algorithm enabled, took ~41 ms per keep-alive request instead of ~0.1 ms,
+ * because the second segment waited for the peer to acknowledge the first. Three rounds
+ * therefore cost upwards of 80 ms when the property is missing and well under 2 ms when
+ * it holds, so 120 ms is diagnostic in both directions. The segment count is the
+ * deterministic half of the assertion; this budget catches a stall arriving by any
+ * other route.
+ */
+const KEEP_ALIVE_ROUNDS = 3;
+const KEEP_ALIVE_BUDGET_MS = 120;
 
 /** Status a tampered configuration file declares, which the payload must ignore. */
 const TAMPERED_STATUS = 'DOWN';
@@ -1086,7 +1139,12 @@ function closeServer(server) {
  * views of it: the parsed status code and the header map for the common case, the
  * verbatim status line for a failure message that names what actually came back,
  * and the complete raw text for the assertions that must prove a header is
- * *absent* — a field a parsed map cannot distinguish from one that was never sent.
+ * *absent* — a field a parsed map cannot distinguish from one that was never sent —
+ * or that anything at all came back, which is how a response is told from silence.
+ *
+ * `Content-Length: 0` is declared so that a refused method is refused on its own
+ * merits rather than on a framing ambiguity. Assertions about the request *line*
+ * itself use {@link rawRequestLine} directly.
  *
  * @param {number} port Loopback port to connect to.
  * @param {string} method Request method, written verbatim.
@@ -1095,18 +1153,40 @@ function closeServer(server) {
  *   The parsed response, plus its status line and its complete raw text.
  */
 function rawRequest(port, method, target) {
+  return rawRequestLine(port, `${method} ${target} HTTP/1.1`, ['Content-Length: 0']);
+}
+
+/**
+ * Write one **complete request line** to a socket verbatim and read the response.
+ *
+ * The lower half of {@link rawRequest}, separated out because three of the
+ * assertions in this file are about the request *line* itself rather than about a
+ * method and a target: a tab where the single space belongs, a line with no method
+ * at all, and an ordinary line carrying header fields that provoke a parser refusal
+ * or an upgrade offer. None of those can be expressed as a method plus a target, and
+ * every one of them must reach the server as the exact bytes written here.
+ *
+ * `Host` and `Connection: close` are always appended — the first because RFC 9112
+ * §3.2 requires it of an HTTP/1.1 request and its absence is a separate condition
+ * not under test here, the second because it makes reading to end of stream a
+ * complete read.
+ *
+ * @param {number} port Loopback port to connect to.
+ * @param {string} requestLine The request line, transmitted exactly as given.
+ * @param {ReadonlyArray<string>} [fields] Header fields, each transmitted verbatim.
+ * @returns {Promise<{statusCode: number, statusLine: string, headers: Map<string, string>, body: string, raw: string}>}
+ *   The parsed response, plus its status line and its complete raw text.
+ */
+function rawRequestLine(port, requestLine, fields = []) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     const socket = net.connect(port, LOOPBACK, () => {
-      socket.write(
-        `${method} ${target} HTTP/1.1${CRLF}Host: ${LOOPBACK}:${port}${CRLF}`
-          + `Connection: close${CRLF}Content-Length: 0${HEAD_BODY_SEPARATOR}`,
-        'ascii',
-      );
+      const request = [requestLine, `Host: ${LOOPBACK}:${port}`, 'Connection: close', ...fields];
+      socket.write(`${request.join(CRLF)}${HEAD_BODY_SEPARATOR}`, 'latin1');
     });
 
     socket.setTimeout(RAW_SOCKET_TIMEOUT_MS, () => {
-      socket.destroy(new Error(`no response to ${method} ${target} within ${RAW_SOCKET_TIMEOUT_MS} ms`));
+      socket.destroy(new Error(`no response to ${JSON.stringify(requestLine)} within ${RAW_SOCKET_TIMEOUT_MS} ms`));
     });
     socket.on('data', (chunk) => chunks.push(chunk));
     socket.on('error', reject);
@@ -1115,10 +1195,10 @@ function rawRequest(port, method, target) {
       const separatorAt = raw.indexOf(HEAD_BODY_SEPARATOR);
       const head = separatorAt < 0 ? raw : raw.slice(0, separatorAt);
       const body = separatorAt < 0 ? '' : raw.slice(separatorAt + HEAD_BODY_SEPARATOR.length);
-      const [statusLine, ...fields] = head.split(CRLF);
+      const [statusLine, ...responseFields] = head.split(CRLF);
       const headers = new Map();
 
-      for (const field of fields) {
+      for (const field of responseFields) {
         const colonAt = field.indexOf(':');
         if (colonAt > 0) {
           headers.set(field.slice(0, colonAt).trim().toLowerCase(), field.slice(colonAt + 1).trim());
@@ -1126,6 +1206,75 @@ function rawRequest(port, method, target) {
       }
 
       resolve({ statusCode: Number(statusLine.split(' ')[1]), statusLine, headers, body, raw });
+    });
+  });
+}
+
+/**
+ * Issue several sequential requests on ONE persistent connection, one segment at a time.
+ *
+ * The only helper here that keeps a socket open across requests, and the only one that
+ * reports the response *segment by segment* rather than concatenated. Both properties
+ * are the point: the contract requires each response to leave in a single write
+ * (`docs/health-endpoint.md` §9.5), and the way that requirement fails is a head
+ * segment followed — tens of milliseconds later, once the peer acknowledges it — by a
+ * body segment. A helper that concatenated the chunks, as {@link rawRequestLine} does,
+ * would parse both spellings into the same result and assert nothing.
+ *
+ * @param {number} port The listener's port.
+ * @param {string} target The request target to send on every round.
+ * @param {number} rounds How many sequential requests to issue on the one connection.
+ * @returns {Promise<Array<{segments: number, first: string, elapsedMs: number}>>} One
+ *   entry per round: how many chunks arrived before the declared body was complete, the
+ *   first chunk verbatim, and the round trip in milliseconds.
+ */
+function keepAliveRounds(port, target, rounds) {
+  return new Promise((resolve, reject) => {
+    const results = [];
+    let chunks = [];
+    let startedAt = 0;
+
+    const socket = net.connect(port, LOOPBACK, () => {
+      startedAt = performance.now();
+      socket.write(`GET ${target} HTTP/1.1${CRLF}Host: ${LOOPBACK}:${port}${CRLF}Connection: keep-alive${HEAD_BODY_SEPARATOR}`, 'latin1');
+    });
+
+    socket.setTimeout(RAW_SOCKET_TIMEOUT_MS, () => {
+      socket.destroy(new Error(`a keep-alive round did not complete within ${RAW_SOCKET_TIMEOUT_MS} ms`));
+    });
+    socket.on('error', reject);
+
+    socket.on('data', (chunk) => {
+      chunks.push(chunk);
+      const raw = Buffer.concat(chunks).toString('latin1');
+      const separatorAt = raw.indexOf(HEAD_BODY_SEPARATOR);
+
+      if (separatorAt < 0) {
+        return;
+      }
+
+      const declared = /content-length:\s*(\d+)/i.exec(raw.slice(0, separatorAt));
+      const body = raw.slice(separatorAt + HEAD_BODY_SEPARATOR.length);
+
+      if (declared === null || body.length < Number(declared[1])) {
+        return;
+      }
+
+      results.push({
+        segments: chunks.length,
+        first: chunks[0].toString('latin1'),
+        elapsedMs: performance.now() - startedAt,
+      });
+      chunks = [];
+
+      if (results.length === rounds) {
+        socket.end();
+        resolve(results);
+        return;
+      }
+
+      startedAt = performance.now();
+      socket.write(`GET ${target} HTTP/1.1${CRLF}Host: ${LOOPBACK}:${port}${CRLF}Connection: keep-alive${HEAD_BODY_SEPARATOR}`, 'latin1');
     });
   });
 }
@@ -1483,6 +1632,63 @@ function createResponseDouble(behavior = {}) {
   };
 
   return { res, recorded };
+}
+
+/**
+ * Build a minimal `net.Socket` stand-in that records what a handler wrote to it.
+ *
+ * The companion to {@link createResponseDouble}, for the three listeners `node:http`
+ * hands a **bare socket** rather than a `ServerResponse`: `'connect'`, `'upgrade'`
+ * and `'clientError'`. Those paths assemble the status line themselves, so what
+ * matters is the exact bytes they produce and — equally — that they produce them in
+ * one write, which only a recorder can show.
+ *
+ * The three unusable states are parameters rather than separate doubles because all
+ * three are ordinary on a public port and each has a different required behaviour:
+ * a destroyed socket and a non-writable one cannot be written to at all, and one
+ * with bytes already written must not receive a second status line, because that
+ * would corrupt the stream the peer is parsing.
+ *
+ * @param {{destroyed?: boolean, writable?: boolean, bytesWritten?: number, failEnd?: boolean}} [state]
+ *   The socket's condition: already destroyed, not writable, already written to, or
+ *   a socket whose `end` throws because it died underneath the write.
+ * @returns {{socket: Object<string, unknown>, recorded: {writes: Array<Buffer>, destroyed: boolean}}}
+ *   The double and its record.
+ */
+function createSocketDouble(state = {}) {
+  const {
+    destroyed = false,
+    writable = true,
+    bytesWritten = 0,
+    failEnd = false,
+  } = state;
+  const recorded = { writes: [], destroyed: false };
+
+  const socket = {
+    destroyed,
+    writable,
+    bytesWritten,
+
+    end(chunk) {
+      if (failEnd) {
+        const failure = new Error('simulated socket failure while writing the response');
+        failure.code = 'ERR_STREAM_DESTROYED';
+        throw failure;
+      }
+      if (chunk !== undefined) {
+        recorded.writes.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), 'latin1'));
+      }
+      return socket;
+    },
+
+    destroy() {
+      recorded.destroyed = true;
+      socket.destroyed = true;
+      return socket;
+    },
+  };
+
+  return { socket, recorded };
 }
 
 /*
@@ -3228,20 +3434,160 @@ describe('health.js — one resource, one spelling, asserted on the wire', () =>
     }
   });
 
-  test('a method token the runtime cannot parse is refused by the runtime, and never served', async () => {
-    // A documented runtime boundary rather than a gap in the handler: Node's HTTP
-    // parser validates the method token against its own table and answers a token it
-    // does not recognise with `400 Bad Request` before any request listener is
-    // entered, so the status code below is the runtime's rather than this
-    // application's. What matters is asserted and holds: the endpoint is not served
-    // through such a request, and the answer never claims the application is
-    // healthy. There is no listener-level hook that could reach it.
-    for (const token of UNPARSABLE_METHOD_TOKENS) {
+  test('a method token the runtime does not recognise is still refused with the contract 405', async () => {
+    // Node's HTTP parser validates the method token against its own table and
+    // refuses anything outside it before any request listener is entered — so
+    // without the `'clientError'` listener `createHealthServer` attaches, the
+    // runtime answers a bodyless `400` here and the three tiers disagree about a
+    // case the contract explicitly covers ("any other method returns 405"). The
+    // request line is well formed and only the method's *value* is unrecognised, so
+    // the contract's answer is the same as for any other refused method: `405`,
+    // `Allow: GET, HEAD`, and the machine-readable error body. The Python and Java
+    // tiers answer these exact bytes the same way.
+    for (const token of UNKNOWN_METHOD_TOKENS) {
       const response = await rawRequest(boundPort, token, HEALTH_PATH);
 
-      assert.strictEqual(response.statusCode, 400, `${token} must be refused by the runtime`);
+      assert.strictEqual(response.statusCode, 405, `${token} must be refused as a method: ${response.statusLine}`);
+      assert.strictEqual(response.headers.get('allow'), ALLOW_HEADER, `${token} must be told what is permitted`);
+      assert.strictEqual(response.headers.get('content-type'), CONTENT_TYPE);
+      assert.strictEqual(response.headers.get('cache-control'), CACHE_CONTROL);
+      assert.strictEqual(response.body, METHOD_NOT_ALLOWED_BODY);
       assert.ok(!response.body.includes('"status"'), 'the refusal must not claim the application is healthy');
+
+      const stillServing = await rawRequest(boundPort, 'GET', HEALTH_PATH);
+      assert.strictEqual(stillServing.statusCode, 200, `the listener must survive ${token}`);
     }
+  });
+
+  test('CONNECT is refused with the contract 405 in both of its target forms, never with silence', async () => {
+    // `CONNECT` never reaches a request listener: Node routes it to the `'connect'`
+    // event, and a server with no listener for that event destroys the socket
+    // without writing anything at all — the client waits for its own timeout and
+    // learns nothing. Both target forms are asserted because a tunnel request
+    // legitimately carries authority-form, and the answer must not depend on the
+    // target: the contract evaluates the method first.
+    for (const target of [HEALTH_PATH, `${LOOPBACK}:${boundPort}`]) {
+      const response = await rawRequest(boundPort, 'CONNECT', target);
+
+      assert.strictEqual(response.statusCode, 405, `CONNECT ${target} must be answered: ${response.statusLine}`);
+      assert.strictEqual(response.headers.get('allow'), ALLOW_HEADER);
+      assert.strictEqual(response.headers.get('content-type'), CONTENT_TYPE);
+      assert.strictEqual(response.headers.get('cache-control'), CACHE_CONTROL);
+      assert.strictEqual(response.body, METHOD_NOT_ALLOWED_BODY);
+      assert.ok(response.raw.length > 0, 'a tunnel request must never be answered with silence');
+
+      const stillServing = await rawRequest(boundPort, 'GET', HEALTH_PATH);
+      assert.strictEqual(stillServing.statusCode, 200, `the listener must survive CONNECT ${target}`);
+    }
+  });
+
+  test('an upgrade offer is declined and the request underneath it is answered as sent', async () => {
+    // An `Upgrade` request is routed to the `'upgrade'` event, and with no listener
+    // it is destroyed unanswered exactly as `CONNECT` is. This server speaks no
+    // upgrade protocol, so it declines to switch and answers the request as sent —
+    // which for `GET /health` is the ordinary `200`, the same answer the Python and
+    // Java tiers give, neither of which has any notion of an upgrade. `101` must
+    // never appear.
+    const response = await rawRequestLine(
+      boundPort,
+      `GET ${HEALTH_PATH} HTTP/1.1`,
+      ['Upgrade: websocket', 'Connection: Upgrade'],
+    );
+
+    assert.strictEqual(response.statusCode, 200, `an upgrade offer must be answered: ${response.statusLine}`);
+    assert.strictEqual(response.headers.get('content-type'), CONTENT_TYPE);
+    assert.strictEqual(response.headers.get('cache-control'), CACHE_CONTROL);
+    assertContractPayload(JSON.parse(response.body), 'an upgrade request');
+
+    const upgradeResponse = await rawRequestLine(
+      boundPort,
+      `GET ${HEALTH_PATH}/ HTTP/1.1`,
+      ['Upgrade: websocket', 'Connection: Upgrade'],
+    );
+    assert.strictEqual(upgradeResponse.statusCode, 404, 'the upgrade path routes by the same rule as every other');
+    assert.strictEqual(upgradeResponse.body, NOT_FOUND_BODY);
+  });
+
+  test('a malformed request line is a 400, and is told apart from an unrecognised method', async () => {
+    // The counterweight to the `405` above, and the reason the fix cannot simply map
+    // the parser's error code to one status: Node reports a tab where RFC 9112 §3
+    // requires a space with the *same* `HPE_INVALID_METHOD` code as `FROBNICATE`. The
+    // line itself is malformed there — the method token is not what is wrong with it
+    // — so claiming "method not allowed" would misdirect whoever reads it. `400` is
+    // the honest answer, and it now carries the contract's headers and a
+    // machine-readable body instead of the runtime's bare status line.
+    for (const requestLine of MALFORMED_REQUEST_LINES) {
+      const response = await rawRequestLine(boundPort, requestLine);
+
+      assert.strictEqual(response.statusCode, 400, `${JSON.stringify(requestLine)}: ${response.statusLine}`);
+      assert.strictEqual(response.headers.get('content-type'), CONTENT_TYPE, 'even a refusal is machine-readable');
+      assert.strictEqual(response.headers.get('cache-control'), CACHE_CONTROL);
+      assert.strictEqual(response.headers.get('allow'), undefined, 'only a 405 carries Allow');
+      assert.strictEqual(response.body, BAD_REQUEST_BODY);
+      assert.ok(!response.body.includes('"status"'), 'the refusal must not claim the application is healthy');
+
+      const stillServing = await rawRequest(boundPort, 'GET', HEALTH_PATH);
+      assert.strictEqual(stillServing.statusCode, 200, 'the listener must survive a malformed request line');
+    }
+  });
+
+  test('an oversized header block is refused with 431 and the listener survives it', async () => {
+    // The third population of parser refusal, and the one whose status the fix must
+    // *preserve*: an over-long header block is `431`, which is both the RFC-correct
+    // answer and what Node itself would have sent. Asserting it proves the
+    // `'clientError'` listener changed the status for one population only.
+    const response = await rawRequestLine(
+      boundPort,
+      `GET ${HEALTH_PATH} HTTP/1.1`,
+      [`X-Oversized: ${'a'.repeat(40000)}`],
+    );
+
+    assert.strictEqual(response.statusCode, 431, response.statusLine);
+    assert.strictEqual(response.headers.get('content-type'), CONTENT_TYPE);
+    assert.strictEqual(response.body, HEADERS_TOO_LARGE_BODY);
+
+    const stillServing = await rawRequest(boundPort, 'GET', HEALTH_PATH);
+    assert.strictEqual(stillServing.statusCode, 200, 'the listener must survive an oversized header block');
+    assertContractPayload(JSON.parse(stillServing.body), 'after an oversized header block');
+  });
+
+  test('each response on a persistent connection arrives in a single segment', async () => {
+    // A latency requirement rather than a content one, and the only one in this file
+    // that a status-and-headers assertion cannot see. The contract requires the whole
+    // response — status line, header block and body — to leave in one write, because the
+    // alternative is a head segment followed by a body segment that a transport may hold
+    // until the peer acknowledges the first: measured at ~41 ms per request at the
+    // sibling Python tier before it was fixed, against ~0.1 ms of actual work, and only
+    // ever on a persistent connection, which is exactly how an orchestrator polls.
+    //
+    // This tier gets the property from `ServerResponse`, which coalesces, and from
+    // `node:http` setting `TCP_NODELAY` on accepted sockets. It is asserted anyway: the
+    // requirement is about the bytes on the wire, not about which layer produced them,
+    // and a future change to the write path here would otherwise be invisible.
+    const rounds = await keepAliveRounds(boundPort, HEALTH_PATH, KEEP_ALIVE_ROUNDS);
+
+    assert.strictEqual(rounds.length, KEEP_ALIVE_ROUNDS, 'every round must complete');
+
+    let total = 0;
+    for (const [index, round] of rounds.entries()) {
+      assert.strictEqual(
+        round.segments,
+        1,
+        `round ${index + 1} arrived in ${round.segments} segments; a body that trails the headers is what stalls`,
+      );
+      assert.ok(round.first.startsWith('HTTP/1.1 200 '), round.first.slice(0, 40));
+      assert.ok(round.first.endsWith('}'), 'the single segment must end with the complete body');
+      assertContractPayload(
+        JSON.parse(round.first.slice(round.first.indexOf(HEAD_BODY_SEPARATOR) + HEAD_BODY_SEPARATOR.length)),
+        `keep-alive round ${index + 1}`,
+      );
+      total += round.elapsedMs;
+    }
+
+    assert.ok(
+      total < KEEP_ALIVE_BUDGET_MS,
+      `${KEEP_ALIVE_ROUNDS} keep-alive rounds took ${total.toFixed(1)} ms; the stall this guards against costs ~41 ms each`,
+    );
   });
 
   test('a request target the runtime cannot parse is refused, and the listener survives it', async () => {
@@ -3408,6 +3754,126 @@ describe('health.js — defensive request paths that a client cannot provoke', (
 
     assert.strictEqual(recorded.endCalls, 0, 'nothing could be written, so nothing was ended');
     assert.strictEqual(recorded.destroyed, true, 'the connection must not be left hanging');
+  });
+
+  test('a socket-level handler writes one complete response, in a single write', () => {
+    // The three socket-level listeners are handed a bare socket rather than a
+    // `ServerResponse`, so they assemble the status line and the headers themselves.
+    // One write is asserted, not merely implied: two writes on an unbuffered socket
+    // are two segments, which is the shape that made the sibling tier's keep-alive
+    // responses wait on a delayed ACK.
+    const { socket, recorded } = createSocketDouble();
+
+    health.handleConnect({ method: 'CONNECT', url: `${LOOPBACK}:3000` }, socket);
+
+    assert.strictEqual(recorded.writes.length, 1, 'the whole response must leave in one write');
+    const written = recorded.writes[0].toString('latin1');
+    assert.ok(written.startsWith('HTTP/1.1 405 Method Not Allowed\r\n'), written.split(CRLF)[0]);
+    assert.ok(written.includes(`${CRLF}Allow: ${ALLOW_HEADER}${CRLF}`), 'the caller must be told what is permitted');
+    assert.ok(written.includes(`${CRLF}Content-Type: ${CONTENT_TYPE}${CRLF}`), 'contract content type');
+    assert.ok(written.includes(`${CRLF}Cache-Control: ${CACHE_CONTROL}${CRLF}`), 'contract cache directive');
+    assert.ok(
+      written.includes(`${CRLF}Content-Length: ${Buffer.byteLength(METHOD_NOT_ALLOWED_BODY, 'utf8')}${CRLF}`),
+      'an accurate byte length',
+    );
+    assert.ok(written.includes(`${CRLF}Connection: close${CRLF}`), 'a refused connection cannot be framed for reuse');
+    assert.ok(written.endsWith(HEAD_BODY_SEPARATOR + METHOD_NOT_ALLOWED_BODY), 'the body is the contract error body');
+  });
+
+  test('the socket-level handlers answer their own populations and nothing else', () => {
+    // Each of the three listeners has exactly one job, and the statuses must not
+    // bleed into each other: an upgrade offer is answered as the request it carries,
+    // an unrecognised method token is the contract's 405, and every other parser
+    // refusal keeps the status the runtime itself would have sent.
+    const cases = [
+      {
+        label: 'upgrade offer on the health path',
+        invoke: (socket) => health.handleUpgrade({ method: 'GET', url: HEALTH_PATH }, socket),
+        expected: 'HTTP/1.1 200 OK',
+      },
+      {
+        label: 'upgrade offer on an alias',
+        invoke: (socket) => health.handleUpgrade({ method: 'GET', url: `${HEALTH_PATH}/` }, socket),
+        expected: 'HTTP/1.1 404 Not Found',
+      },
+      {
+        label: 'unrecognised method token',
+        invoke: (socket) => health.handleClientError(
+          { code: 'HPE_INVALID_METHOD', rawPacket: Buffer.from('FROBNICATE /health HTTP/1.1\r\n') },
+          socket,
+        ),
+        expected: 'HTTP/1.1 405 Method Not Allowed',
+      },
+      {
+        label: 'malformed request line reported under the same code',
+        invoke: (socket) => health.handleClientError(
+          { code: 'HPE_INVALID_METHOD', rawPacket: Buffer.from('GET\t/health HTTP/1.1\r\n') },
+          socket,
+        ),
+        expected: 'HTTP/1.1 400 Bad Request',
+      },
+      {
+        label: 'method token with no request line to read',
+        invoke: (socket) => health.handleClientError({ code: 'HPE_INVALID_METHOD' }, socket),
+        expected: 'HTTP/1.1 400 Bad Request',
+      },
+      {
+        label: 'oversized header block',
+        invoke: (socket) => health.handleClientError({ code: 'HPE_HEADER_OVERFLOW' }, socket),
+        expected: 'HTTP/1.1 431 Request Header Fields Too Large',
+      },
+      {
+        label: 'a request that never completed',
+        invoke: (socket) => health.handleClientError({ code: 'ERR_HTTP_REQUEST_TIMEOUT' }, socket),
+        expected: 'HTTP/1.1 408 Request Timeout',
+      },
+      {
+        label: 'malformed framing',
+        invoke: (socket) => health.handleClientError({ code: 'HPE_INVALID_HEADER_TOKEN' }, socket),
+        expected: 'HTTP/1.1 400 Bad Request',
+      },
+    ];
+
+    for (const { label, invoke, expected } of cases) {
+      const { socket, recorded } = createSocketDouble();
+      invoke(socket);
+
+      assert.strictEqual(recorded.writes.length, 1, `${label}: exactly one response`);
+      const statusLine = recorded.writes[0].toString('latin1').split(CRLF)[0];
+      assert.strictEqual(statusLine, expected, label);
+    }
+  });
+
+  test('a socket that is gone is destroyed rather than written to, and nothing throws', () => {
+    // Three ways a socket can be unusable, all of them ordinary on a public port: the
+    // peer reset the connection, the socket is already destroyed, or bytes have
+    // already been written to it — in which case appending a second status line would
+    // corrupt the stream the peer is parsing. None of them may throw, because an
+    // exception escaping an event handler takes the whole process down.
+    const reset = createSocketDouble();
+    health.handleClientError({ code: 'ECONNRESET' }, reset.socket);
+    assert.strictEqual(reset.recorded.writes.length, 0, 'a reset peer cannot be answered');
+    assert.strictEqual(reset.recorded.destroyed, true, 'the socket must be released');
+
+    const inFlight = createSocketDouble({ bytesWritten: 64 });
+    health.handleConnect({ method: 'CONNECT', url: '/health' }, inFlight.socket);
+    assert.strictEqual(inFlight.recorded.writes.length, 0, 'a response already in flight must not be corrupted');
+    assert.strictEqual(inFlight.recorded.destroyed, true, 'the socket must be released');
+
+    const gone = createSocketDouble({ destroyed: true });
+    health.handleUpgrade({ method: 'GET', url: HEALTH_PATH }, gone.socket);
+    assert.strictEqual(gone.recorded.writes.length, 0, 'a destroyed socket cannot be written to');
+
+    const failing = createSocketDouble({ failEnd: true });
+    assert.doesNotThrow(() => health.handleConnect({ method: 'CONNECT', url: '/health' }, failing.socket));
+    assert.strictEqual(failing.recorded.destroyed, true, 'a failed write still releases the socket');
+
+    for (const absent of [null, undefined]) {
+      assert.doesNotThrow(
+        () => health.handleClientError({ code: 'HPE_INVALID_HEADER_TOKEN' }, absent),
+        'an absent socket is not an exception',
+      );
+    }
   });
 });
 
