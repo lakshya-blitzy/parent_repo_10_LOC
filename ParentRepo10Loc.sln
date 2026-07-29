@@ -8,24 +8,24 @@ EndProject
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "ParentRepo10Loc.Tests", "tests\ParentRepo10Loc.Tests\ParentRepo10Loc.Tests.csproj", "{6377F257-BE20-4FF4-8260-D685AF551BF9}"
 EndProject
 Global
-	GlobalSection(SolutionConfigurationPlatforms) = preSolution
-		Debug|Any CPU = Debug|Any CPU
-		Release|Any CPU = Release|Any CPU
-	EndGlobalSection
-	GlobalSection(ProjectConfigurationPlatforms) = postSolution
-		{A2F42F67-2C55-49BC-B39D-238FF3E4191C}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
-		{A2F42F67-2C55-49BC-B39D-238FF3E4191C}.Debug|Any CPU.Build.0 = Debug|Any CPU
-		{A2F42F67-2C55-49BC-B39D-238FF3E4191C}.Release|Any CPU.ActiveCfg = Release|Any CPU
-		{A2F42F67-2C55-49BC-B39D-238FF3E4191C}.Release|Any CPU.Build.0 = Release|Any CPU
-		{6377F257-BE20-4FF4-8260-D685AF551BF9}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
-		{6377F257-BE20-4FF4-8260-D685AF551BF9}.Debug|Any CPU.Build.0 = Debug|Any CPU
-		{6377F257-BE20-4FF4-8260-D685AF551BF9}.Release|Any CPU.ActiveCfg = Release|Any CPU
-		{6377F257-BE20-4FF4-8260-D685AF551BF9}.Release|Any CPU.Build.0 = Release|Any CPU
-	EndGlobalSection
-	GlobalSection(SolutionProperties) = preSolution
-		HideSolutionNode = FALSE
-	EndGlobalSection
-	GlobalSection(ExtensibilityGlobals) = postSolution
-		SolutionGuid = {AC3E1A7C-F9A6-47B2-A6C5-F9ED18243DAA}
-	EndGlobalSection
+  GlobalSection(SolutionConfigurationPlatforms) = preSolution
+    Debug|Any CPU = Debug|Any CPU
+    Release|Any CPU = Release|Any CPU
+  EndGlobalSection
+  GlobalSection(ProjectConfigurationPlatforms) = postSolution
+    {A2F42F67-2C55-49BC-B39D-238FF3E4191C}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+    {A2F42F67-2C55-49BC-B39D-238FF3E4191C}.Debug|Any CPU.Build.0 = Debug|Any CPU
+    {A2F42F67-2C55-49BC-B39D-238FF3E4191C}.Release|Any CPU.ActiveCfg = Release|Any CPU
+    {A2F42F67-2C55-49BC-B39D-238FF3E4191C}.Release|Any CPU.Build.0 = Release|Any CPU
+    {6377F257-BE20-4FF4-8260-D685AF551BF9}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+    {6377F257-BE20-4FF4-8260-D685AF551BF9}.Debug|Any CPU.Build.0 = Debug|Any CPU
+    {6377F257-BE20-4FF4-8260-D685AF551BF9}.Release|Any CPU.ActiveCfg = Release|Any CPU
+    {6377F257-BE20-4FF4-8260-D685AF551BF9}.Release|Any CPU.Build.0 = Release|Any CPU
+  EndGlobalSection
+  GlobalSection(SolutionProperties) = preSolution
+    HideSolutionNode = FALSE
+  EndGlobalSection
+  GlobalSection(ExtensibilityGlobals) = postSolution
+    SolutionGuid = {AC3E1A7C-F9A6-47B2-A6C5-F9ED18243DAA}
+  EndGlobalSection
 EndGlobal
