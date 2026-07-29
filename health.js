@@ -10,30 +10,22 @@
  * what keeps the levels runtime-independent. Nothing here references a path
  * outside this tier.
  *
- * The frozen contract implemented below:
+ * The contract's three responses, which are the whole of its vocabulary:
  *
- *   | Element         | Normative value                                        |
- *   | --------------- | ------------------------------------------------------ |
- *   | Resource path   | `/health` — frozen; configuration may restate it but   |
- *   |                 | never redefine it                                      |
- *   | Methods         | `GET`, `HEAD`                                          |
- *   | Success status  | `200 OK` (mandatory for a healthy status)              |
- *   | Content type    | `application/json; charset=utf-8`                      |
- *   | Cache directive | `Cache-Control: no-store`                              |
- *   | Body members    | exactly four, in order: name, version, timestamp, status |
- *   | Serialization   | compact — no insignificant whitespace                  |
- *   | `timestamp`     | RFC 3339 UTC, `Z` suffix, millisecond precision, fresh |
- *   |                 | per request                                            |
- *   | `status`        | the literal string `UP` — a compiled-in protocol       |
- *   |                 | constant, never a configuration input                  |
- *   | Wrong method    | `405` + `Allow: GET, HEAD` + `{"error":"Method Not Allowed"}` |
- *   | Unknown path    | `404` + `{"error":"Not Found"}`, for a `GET` or a `HEAD` |
+ *   - `200` with the four-member body `{name, version, timestamp, status}` in that
+ *     order, compactly serialized, `Content-Type: application/json; charset=utf-8`
+ *     and `Cache-Control: no-store`.
+ *   - `405` + `Allow: GET, HEAD` + `{"error":"Method Not Allowed"}` for any other
+ *     method, whatever the path.
+ *   - `404` + `{"error":"Not Found"}` for a `GET` or `HEAD` of any other path.
  *
- * Routing is METHOD FIRST, then path. `GET` and `HEAD` are accepted, so only a
- * `GET` or `HEAD` for some other path answers `404` — an unsupported method
- * answers `405` with `Allow: GET, HEAD` whatever the path, which makes
- * `POST /unknown` a `405` rather than a `404`. The contract defines exactly those
- * three responses and no 5xx.
+ * Routing is METHOD FIRST, then path, which is why `POST /unknown` answers `405`
+ * rather than `404`: a caller learns the most actionable fact first. **No routed
+ * request can produce a 5xx**, and no code path in this module writes one — the
+ * handler reads one already-resolved value set and one clock, so it has no
+ * expected failure. An unexpected internal fault is reported server-side and the
+ * connection is closed without inventing a status; see
+ * {@link finalizeAfterUnexpectedError}.
  *
  * A canonical success body, byte for byte:
  *
@@ -49,7 +41,7 @@
  * draft's `time` because the draft scopes `time` to when an observed value was
  * *recorded*, while this carries the *current* time.
  *
- * Four constraints, each for a concrete reason:
+ * Five constraints, each for a concrete reason:
  *
  *   - **CommonJS only**, never `import` / `export`. The sibling `package.json`
  *     omits the ES-module `type` field so the whole tier resolves as CommonJS,
@@ -60,30 +52,29 @@
  *     configuration files and returns; it binds no socket, writes nothing to
  *     either stream and schedules no timer, so the unit suite can assert the
  *     payload without opening a port. All binding lives in `server.js`.
- *   - **Configuration once, clock per request.** Identity and serving parameters
- *     are resolved a single time at module load; only the clock is read inside
- *     the handler. That keeps the probe lightweight (no per-request I/O) while
- *     still making every response provably fresh.
- *   - **Configuration cannot redefine the frozen contract.** Only the values the
- *     contract leaves open — the identity pair and the bind target — are resolved
- *     from a source outside this file. The resource path and the `status` literal
- *     are compiled-in constants: a configuration document may restate them, and
- *     one that names anything else is *rejected and reported*, never honoured. A
- *     settable path would move the endpoint monitoring polls, and a settable
- *     status would let a deployment lie about its own health; both would corrupt
- *     the contract while leaving the response syntactically valid, which is the
- *     hardest kind of failure to notice.
+ *   - **Configuration once, clock per request.** Identity and serving values are
+ *     resolved a single time at module load; only the clock is read inside the
+ *     handler. That keeps the probe lightweight (no per-request I/O) while still
+ *     making every response provably fresh.
+ *   - **Every served value is resolved from a declared source, and configuration
+ *     still cannot redefine the contract.** Nothing is hard-coded at its point of
+ *     use: the identity pair resolves from `package.json`, and the bind target,
+ *     the resource path and the status all resolve from `config/health.json`
+ *     through {@link loadConfig}. For the two the contract freezes —
+ *     the path and the status — resolution is *validated*: a declared value is
+ *     adopted only when it is exactly the contract's own literal, and any other
+ *     value is rejected, recorded in {@link frozenValueConflicts} and reported at
+ *     start-up while the frozen literal continues to be served. A settable path
+ *     would move the endpoint a probe polls, and a settable status would let a
+ *     deployment lie about its own health; both would corrupt the contract while
+ *     leaving the response syntactically valid, which is the hardest kind of
+ *     failure to notice. {@link configSources} records which link of each chain
+ *     supplied each value, so the source-to-runtime mapping is assertable.
  *   - **Exactly one accepted request target.** The path comparison is made against
  *     the request target's raw origin-form path, with only the query component
  *     removed. Nothing is percent-decoded, no dot segment is collapsed and no
  *     absolute-form target is accepted, so `/health` is the one and only spelling
  *     that answers `200`.
- *   - **No routed request can produce a 5xx.** The handler performs no I/O, so the
- *     contract defines `200`, `405` and `404` and nothing else, and every
- *     degradation resolves to one of those. The single non-normative exception is
- *     unreachable on every contract path: an internal fault that leaves nothing on
- *     the wire fails closed with a `503` rather than misreporting itself as a
- *     route miss — see {@link finalizeAfterUnexpectedError}.
  *
  * @module health
  */
@@ -93,44 +84,69 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 /**
- * The one resource path this tier serves — a frozen contract constant.
+ * The one resource path this tier serves — the contract's frozen value for it.
  *
- * It is deliberately *not* a setting. The contract admits exactly one route, all
- * three tiers serve the same one, and every probe, `HEALTHCHECK` instruction and
- * workflow assertion in the composition is written against this literal. A
- * configuration document may restate it; a document that names a different path
- * is rejected by {@link findFrozenValueConflicts} and reported at start-up rather
- * than silently moving the endpoint away from where monitoring looks for it.
+ * The contract admits exactly one route, all three tiers serve the same one, and
+ * every probe written against this endpoint addresses this literal. It is
+ * therefore a *validated* setting rather than a free one: {@link loadConfig}
+ * resolves `path` from `config/health.json`, but adopts the declared value only
+ * when it is exactly this literal. Any other declaration is rejected by
+ * {@link resolveFrozenValue}, recorded by {@link findFrozenValueConflicts} and
+ * reported at start-up, rather than silently moving the endpoint away from where
+ * monitoring looks for it. When the declaration is absent this literal is the
+ * fallback, so a missing file degrades to identical behaviour.
  *
- * The status literal is frozen in exactly the same way and for the same reasons,
- * and is declared with the other contract constants as {@link STATUS_UP}.
+ * The status literal is validated in exactly the same way and for the same
+ * reasons, and is declared with the other contract constants as
+ * {@link STATUS_UP}.
  *
  * @type {string}
  */
 const FROZEN_PATH = '/health';
 
 /**
- * Compiled-in literals for every payload and serving value.
+ * The one healthy status value the contract permits, and the contract's frozen
+ * value for the `status` member.
  *
- * For `name`, `version`, `host` and `port` these are the last link of the
- * resolution chain (environment variable, then configuration file, then these).
- * They are required rather than decorative: they guarantee that the endpoint
- * still serves a valid, complete contract when a configuration file is absent
- * from a container image, which is precisely the failure mode a health endpoint
- * has to survive. An endpoint that cannot answer because its own configuration
- * is missing is worse than no endpoint at all, because it turns a running
- * application into one that reports itself unhealthy. When a fallback is used
- * because a source was missing or malformed, the reason is recorded in
- * {@link configDegradations} rather than discarded, so the substitution is
- * observable instead of silent.
+ * A wire-protocol constant that a deployment may restate but never choose. It is
+ * resolved by {@link loadConfig} from `config/health.json` exactly as `path` is,
+ * and validated exactly as strictly: a declaration equal to this literal is
+ * adopted, and any other declaration is rejected, recorded and reported. That
+ * strictness is a safety property rather than a simplification. A freely settable
+ * `status` would let a deployment, or a stray edit to a container image, publish
+ * `"status":"DOWN"` — or any other string — from a process that is running
+ * perfectly well, and would let two tiers of this composition disagree about the
+ * one value every consumer branches on. This endpoint reports process liveness and
+ * performs no dependency checks, so the word on the wire has to mean "this process
+ * answered", and it can only mean that if nothing outside the contract is able to
+ * choose it. A live process is `UP` by definition.
  *
- * There is deliberately no `status` member here, and `path` is not a fallback but
- * the frozen constant itself. `status` is not a setting and therefore has no
- * fallback: it is the wire protocol's own constant, declared once as
- * {@link STATUS_UP} and never resolved from anything. `path` is single-sourced
- * from {@link FROZEN_PATH} so this object can never drift from it.
+ * A rejection is never silent, and never refuses to serve: the endpoint keeps
+ * answering with this literal and `server.js` names the rejected value once at
+ * start-up — see {@link findFrozenValueConflicts}.
  *
- * @type {Readonly<{name: string, version: string, host: string, port: number, path: string}>}
+ * @type {string}
+ */
+const STATUS_UP = 'UP';
+
+/**
+ * Compiled-in literals for every payload and serving value — the last link of
+ * every resolution chain.
+ *
+ * Required rather than decorative: they guarantee that the endpoint still serves
+ * a valid, complete contract when a configuration file is absent from a container
+ * image, which is precisely the failure mode a health endpoint has to survive. An
+ * endpoint that cannot answer because its own configuration is missing is worse
+ * than no endpoint at all, because it turns a running application into one that
+ * reports itself unhealthy. When a fallback is used because a source was missing
+ * or malformed, the reason is recorded in {@link configDegradations} rather than
+ * discarded, so the substitution is observable instead of silent.
+ *
+ * `path` and `status` are single-sourced here from {@link FROZEN_PATH} and
+ * {@link STATUS_UP}, so the fallbacks can never drift from the contract values
+ * the resolver validates declarations against.
+ *
+ * @type {Readonly<{name: string, version: string, host: string, port: number, path: string, status: string}>}
  */
 const DEFAULTS = Object.freeze({
   name: 'parent_repo_10_LOC',
@@ -138,6 +154,7 @@ const DEFAULTS = Object.freeze({
   host: '0.0.0.0',
   port: 3000,
   path: FROZEN_PATH,
+  status: STATUS_UP,
 });
 
 /**
@@ -164,45 +181,18 @@ const DEFAULTS = Object.freeze({
 const IDENTITY_MANIFEST_PATH = path.join(__dirname, 'package.json');
 
 /**
- * Absolute location of the serving configuration supplying host, port and the
- * resource path. Anchored to `__dirname` for the same reason.
+ * Absolute location of the serving configuration supplying host, port, the
+ * resource path and the status. Anchored to `__dirname` for the same reason.
  *
- * That file also *declares* the status literal, to document the contract it
- * serves, but this module never resolves the payload's `status` from that member:
- * see {@link STATUS_UP}. {@link declaredStatus} reads the declaration
- * deliberately, for a caller that wants to inspect it, and the unit suite asserts
- * that the declaration and the constant agree so the two cannot drift.
+ * All four are resolved from this file. Host and port resolve freely, behind the
+ * environment layer; path and status resolve through {@link resolveFrozenValue},
+ * which adopts a declaration only when it is exactly the contract's own literal
+ * and rejects any other. The unit suite asserts both halves: that the shipped
+ * declarations are adopted, and that a hostile one is refused and reported.
  *
  * @type {string}
  */
 const SERVING_CONFIG_PATH = path.join(__dirname, 'config', 'health.json');
-
-/**
- * The one healthy status value the contract permits: a compiled-in literal, and
- * the one payload member with no precedence chain at all.
- *
- * A wire-protocol constant, not a setting, and that distinction is the whole point
- * of it living here rather than in {@link DEFAULTS}. Nothing may override it — not
- * an environment variable, not `config/health.json`, not anything outside this
- * file — and that is a safety property rather than a simplification. A `status`
- * resolvable from a configuration file would let a deployment, or a stray edit to a
- * container image, publish `"status":"DOWN"` — or any other string — from a process
- * that is running perfectly well, and would let two tiers of this composition
- * disagree about the one value every consumer branches on. This endpoint reports
- * process liveness and performs no dependency checks, so the word on the wire has
- * to mean "this process answered", and it can only mean that if nothing outside
- * this file is able to choose it. A live process is `UP` by definition: the value is
- * compiled in, single-sourced here, and used verbatim by
- * {@link buildHealthPayload}.
- *
- * A configuration file that declares something else is ignored rather than adopted,
- * which follows this module's policy everywhere: degrade to the literal and keep
- * answering, never refuse to serve. The rejection is not silent — see
- * {@link findFrozenValueConflicts}.
- *
- * @type {string}
- */
-const STATUS_UP = 'UP';
 
 /** Contract content type. Deliberately not `application/health+json`. @type {string} */
 const CONTENT_TYPE = 'application/json; charset=utf-8';
@@ -217,21 +207,13 @@ const STATUS_OK = 200;
 const STATUS_NOT_FOUND = 404;
 const STATUS_METHOD_NOT_ALLOWED = 405;
 
-/**
- * Status of the last-resort branch in {@link finalizeAfterUnexpectedError}.
- *
- * Not a contract response: the contract defines exactly `200`, `405` and `404`,
- * and a routed request cannot fail. This is the implementation-specific,
- * non-normative answer to a fault that cannot occur by design.
- */
-const STATUS_SERVICE_UNAVAILABLE = 503;
-
-// Error bodies, pre-serialized once because they never vary. All three share the
+// Error bodies, pre-serialized once because they never vary. Both share the
 // single-member `{"error":"<reason phrase>"}` shape and the same compact
-// separators as the success body.
+// separators as the success body. There is deliberately no third body: the
+// contract's vocabulary is `200`, `405` and `404`, so no other status is ever
+// written.
 const NOT_FOUND_BODY = JSON.stringify({ error: 'Not Found' });
 const METHOD_NOT_ALLOWED_BODY = JSON.stringify({ error: 'Method Not Allowed' });
-const SERVICE_UNAVAILABLE_BODY = JSON.stringify({ error: 'Service Unavailable' });
 
 /**
  * First character of an origin-form request target (RFC 9112, §3.2.1).
@@ -254,10 +236,41 @@ const ORIGIN_FORM_PREFIX = '/';
  */
 const QUERY_DELIMITER = '?';
 
-// `0` asks the operating system for an ephemeral port, which is how the test
-// suite binds without colliding with a running server.
-const MIN_PORT = 0;
+// The usable range for a *configured* port. `0` is deliberately excluded, and
+// that exclusion is the one cross-tier port policy: all three tiers reject a
+// configured `0` identically. Port `0` asks the operating system to choose a
+// port at random, so a process that honoured it would bind an address that no
+// `HEALTHCHECK` instruction, probe or workflow assertion could predict — the
+// endpoint would be running and unreachable at the same time, which is the exact
+// condition a health endpoint exists to rule out. A suite that wants an ephemeral
+// port still gets one: it passes `0` to `listen()` on the server returned by
+// `createHealthServer()`, which is a bind-time argument rather than configuration.
+const MIN_PORT = 1;
 const MAX_PORT = 65535;
+
+/**
+ * The three links a resolved value can come from, as reported by
+ * {@link configSources}.
+ *
+ * Recording the link is what makes the source-to-runtime mapping *provable*
+ * rather than merely intended. For `host` and `port` a distinct declared value is
+ * evidence enough on its own, but the two values the contract freezes have exactly
+ * one legal declaration — the contract's own literal — so a resolved value equal
+ * to the fallback is indistinguishable from a value that was never read. The
+ * provenance label removes that ambiguity: `file` means the declaration was read
+ * and adopted, and `fallback` means it was absent or rejected. A test, and an
+ * operator reading the resolved configuration, can therefore tell a working chain
+ * from a dead one.
+ *
+ * @type {string}
+ */
+const FROM_ENVIRONMENT = 'environment';
+
+/** @type {string} */
+const FROM_FILE = 'file';
+
+/** @type {string} */
+const FROM_FALLBACK = 'fallback';
 
 // Stripped before parsing so a BOM-prefixed configuration file still loads.
 const BYTE_ORDER_MARK = '\uFEFF';
@@ -430,7 +443,7 @@ function usableString(candidate) {
 }
 
 /**
- * Resolve the first usable string from an ordered list of candidates.
+ * Resolve the first usable string from an ordered list of labelled candidates.
  *
  * Candidates are supplied highest precedence first — environment variable, then
  * configuration file value — and the compiled-in literal is the fallback. A
@@ -438,54 +451,96 @@ function usableString(candidate) {
  * variable, an empty string, a `null` and a value of the wrong type are all
  * skipped rather than being accepted as a deliberate override.
  *
- * @param {ReadonlyArray<unknown>} candidates Ordered candidates, highest precedence first.
+ * The winning candidate's label is returned alongside the value, so the caller can
+ * record which link of the chain supplied it — see {@link FROM_ENVIRONMENT}.
+ *
+ * @param {ReadonlyArray<{source: string, value: unknown}>} candidates Ordered
+ *   candidates, highest precedence first, each labelled with its link.
  * @param {string} fallback Compiled-in literal used when no candidate qualifies.
- * @returns {string} The resolved, trimmed value.
+ * @returns {{value: string, source: string}} The resolved, trimmed value and its link.
  */
 function resolveString(candidates, fallback) {
-  for (const candidate of candidates) {
-    if (usableString(candidate)) {
-      return candidate.trim();
+  for (const { source, value } of candidates) {
+    if (usableString(value)) {
+      return { value: value.trim(), source };
     }
   }
-  return fallback;
+  return { value: fallback, source: FROM_FALLBACK };
 }
 
 /**
- * Resolve the first usable TCP port from an ordered list of candidates.
+ * Resolve the first usable TCP port from an ordered list of labelled candidates.
  *
  * Accepts a JSON number or a decimal string (an environment variable is always a
- * string) and requires an integer inside the valid port range. Anything else —
- * `"abc"`, `"3000x"`, `-1`, `70000`, `3000.5` — is skipped in favour of the next
- * candidate, so a typo in one source degrades to the next source rather than
- * making the listener unbindable.
+ * string) and requires an integer inside the usable port range. Anything else —
+ * `"abc"`, `"3000x"`, `-1`, `70000`, `3000.5`, and `0` — is skipped in favour of
+ * the next candidate, so a typo in one source degrades to the next source rather
+ * than making the listener unbindable. `0` is excluded by {@link MIN_PORT} for the
+ * reason recorded there: a configured ephemeral port would bind an address no
+ * probe could predict.
+ *
+ * @param {ReadonlyArray<{source: string, value: unknown}>} candidates Ordered
+ *   candidates, highest precedence first, each labelled with its link.
+ * @param {number} fallback Compiled-in literal used when no candidate qualifies.
+ * @returns {{value: number, source: string}} The resolved port and its link.
  */
 function resolvePort(candidates, fallback) {
-  for (const candidate of candidates) {
+  for (const { source, value } of candidates) {
     let numeric = null;
-    if (typeof candidate === 'number') {
-      numeric = candidate;
-    } else if (typeof candidate === 'string' && /^[0-9]+$/.test(candidate.trim())) {
-      numeric = Number.parseInt(candidate.trim(), 10);
+    if (typeof value === 'number') {
+      numeric = value;
+    } else if (typeof value === 'string' && /^[0-9]+$/.test(value.trim())) {
+      numeric = Number.parseInt(value.trim(), 10);
     }
     if (numeric !== null && Number.isInteger(numeric) && numeric >= MIN_PORT && numeric <= MAX_PORT) {
-      return numeric;
+      return { value: numeric, source };
     }
   }
-  return fallback;
+  return { value: fallback, source: FROM_FALLBACK };
+}
+
+/**
+ * Resolve a value the contract freezes, adopting a declaration only when it is
+ * exactly the contract's own literal.
+ *
+ * This is what makes `path` and `status` genuinely *resolved settings* rather than
+ * either dead declarations or free ones. The serving document is the declared
+ * source for both — `config/health.json` carries them so an operator sees the whole
+ * shape of what is served in one place — so the value that routes and the value
+ * that is reported are read from that source like every other setting. What differs
+ * is the validation: the contract admits exactly one legal value for each, so a
+ * declaration is adopted only when it matches it exactly, and anything else is
+ * *rejected* rather than honoured.
+ *
+ * A rejection never refuses to serve. The frozen literal is used, so the endpoint
+ * keeps answering the contract; the rejection is recorded by
+ * {@link findFrozenValueConflicts} and reported once at start-up, and the returned
+ * link is {@link FROM_FALLBACK}, so neither an operator nor a test can mistake a
+ * rejected declaration for an honoured one.
+ *
+ * @param {unknown} declared The value the serving document declares, if any.
+ * @param {string} frozen The contract's literal for this value.
+ * @returns {{value: string, source: string}} The frozen literal, labelled `file`
+ *   when the declaration was read and adopted and `fallback` when it was absent,
+ *   blank, of the wrong type or rejected.
+ */
+function resolveFrozenValue(declared, frozen) {
+  if (usableString(declared) && declared.trim() === frozen) {
+    return { value: frozen, source: FROM_FILE };
+  }
+  return { value: frozen, source: FROM_FALLBACK };
 }
 
 /**
  * Audit a serving document for values that attempt to redefine a frozen contract
- * constant.
+ * value.
  *
- * The resource path and the status literal are part of the contract rather than
- * of the deployment, so this function never *resolves* them — the constants are
- * used directly. What it does is notice when a document declares something other
- * than the frozen value, so the rejection can be reported instead of being
- * swallowed. `config/health.json` ships both keys deliberately, restating the
- * contract where an operator reading the file will see it; a restatement produces
- * no conflict, and an absent key produces none either.
+ * The companion to {@link resolveFrozenValue}: that function decides what is
+ * served, and this one records what was refused. `config/health.json` ships both
+ * keys deliberately, restating the contract where an operator reading the file will
+ * see it; a restatement is adopted and produces no conflict, and an absent key
+ * produces none either. Anything else is a conflict, so the rejection can be
+ * reported instead of being swallowed.
  *
  * Pure by design: it reads no file, writes nothing, logs nothing and throws
  * nothing, so it is safe to call during module load. Reporting is the caller's
@@ -560,25 +615,24 @@ const SERVING_LOAD = readJsonFile(SERVING_CONFIG_PATH);
  *     tracked file. Levels 2 and 3 deliberately use the prefixed `HEALTH_HOST` and
  *     `HEALTH_PORT` names instead; that asymmetry is intentional and must not be
  *     "harmonized".
- *   - `path` — `config/health.json`, then the literal. No environment override,
- *     because moving the resource path per process would break the contract every
- *     consumer probes.
- *
- * `path` and `status` take no part in that chain at all. They are frozen contract
- * constants, assigned here from {@link FROZEN_PATH} and {@link STATUS_UP}, so
- * that no source outside this file can move the endpoint or change what it
- * reports. A document that declares either differently is recorded by
- * {@link findFrozenValueConflicts} and reported by the entry point.
+ *   - `path`, `status` — `config/health.json`, then the literal, with the
+ *     declaration *validated* against the contract before it is adopted (see
+ *     {@link resolveFrozenValue}). No environment override, because moving the
+ *     resource path or the reported status per process would break the contract
+ *     every consumer probes; and no free choice from the file either, because the
+ *     contract admits exactly one legal value for each.
  *
  * Every source is read at module scope and nowhere else, so the whole file has a
  * single place where resolution happens and no value is hard-coded at its point
- * of use.
+ * of use — including the two the contract freezes, which are read from the
+ * declared source like everything else and merely validated more strictly.
  *
- * `status` is deliberately absent from what this resolves. It is a protocol
- * constant rather than a serving parameter, so it has no precedence chain and no
- * configuration source at all: see {@link STATUS_UP}.
+ * The second return member records **where each value came from**, so the chain is
+ * assertable rather than assumed: see {@link FROM_ENVIRONMENT}. It is the only way
+ * to distinguish an adopted declaration from an absent or rejected one for `path`
+ * and `status`, whose legal declaration is by definition equal to the fallback.
  *
- * Degradation recording is the second half of the job. When a declared source
+ * Degradation recording is the third part of the job. When a declared source
  * cannot supply its values, the endpoint still answers — that is the whole point
  * of the literal fallbacks — but the substitution is written into the returned
  * `degradations` list instead of vanishing. `identity` is reported first and
@@ -586,22 +640,49 @@ const SERVING_LOAD = readJsonFile(SERVING_CONFIG_PATH);
  * sources. Nothing is printed from here: module load must stay byte-silent, and
  * `server.js` renders the list once at start-up.
  *
- * @returns {{values: Readonly<{name: string, version: string, host: string, port: number, path: string}>, degradations: ReadonlyArray<string>}}
- *   The frozen effective configuration and the frozen, possibly empty, list of
- *   `"<source>: <reason>"` degradations in declared order.
+ * @returns {{values: Readonly<{name: string, version: string, host: string, port: number, path: string, status: string}>, sources: Readonly<Object<string, string>>, degradations: ReadonlyArray<string>}}
+ *   The frozen effective configuration, the frozen per-value provenance map, and
+ *   the frozen, possibly empty, list of `"<source>: <reason>"` degradations in
+ *   declared order.
  */
 function loadConfig() {
   const identity = IDENTITY_LOAD.document || {};
   const serving = SERVING_LOAD.document || {};
   const env = process.env;
 
+  const resolved = {
+    name: resolveString([{ source: FROM_FILE, value: identity.name }], DEFAULTS.name),
+    version: resolveString([{ source: FROM_FILE, value: identity.version }], DEFAULTS.version),
+    host: resolveString(
+      [
+        { source: FROM_ENVIRONMENT, value: env.HOST },
+        { source: FROM_FILE, value: serving.host },
+      ],
+      DEFAULTS.host,
+    ),
+    port: resolvePort(
+      [
+        { source: FROM_ENVIRONMENT, value: env.PORT },
+        { source: FROM_FILE, value: serving.port },
+      ],
+      DEFAULTS.port,
+    ),
+    path: resolveFrozenValue(serving.path, FROZEN_PATH),
+    status: resolveFrozenValue(serving.status, STATUS_UP),
+  };
+
   const values = Object.freeze({
-    name: resolveString([identity.name], DEFAULTS.name),
-    version: resolveString([identity.version], DEFAULTS.version),
-    host: resolveString([env.HOST, serving.host], DEFAULTS.host),
-    port: resolvePort([env.PORT, serving.port], DEFAULTS.port),
-    path: FROZEN_PATH,
+    name: resolved.name.value,
+    version: resolved.version.value,
+    host: resolved.host.value,
+    port: resolved.port.value,
+    path: resolved.path.value,
+    status: resolved.status.value,
   });
+
+  const sources = Object.freeze(
+    Object.fromEntries(Object.keys(resolved).map((key) => [key, resolved[key].source])),
+  );
 
   // A source that parsed but supplies none of the members it is the declared
   // source for is a distinct, actionable condition: the file is present and
@@ -623,17 +704,17 @@ function loadConfig() {
     degradations.push(`${SOURCE_SERVING}: ${servingReason}`);
   }
 
-  return { values, degradations: Object.freeze(degradations) };
+  return { values, sources, degradations: Object.freeze(degradations) };
 }
 
 /**
- * Report the `status` a serving document declares, for inspection only.
+ * Report the `status` a serving document declares, before validation.
  *
- * Reading a declaration and honouring it are different things, and this function
- * exists so the first is possible without the second. An operator comparing a
- * file against what the endpoint reports, or the unit suite proving a declaration
- * is powerless, can call this instead of re-implementing the read — while
- * {@link buildHealthPayload} continues to ignore the value entirely.
+ * Reading a declaration and adopting it are different things, and this function
+ * exposes the first without the second. An operator comparing a file against what
+ * the endpoint reports, or the unit suite proving that an illegal declaration is
+ * refused, can call this instead of re-implementing the read — while
+ * {@link resolveFrozenValue} decides whether the value is adopted or rejected.
  *
  * Mirrors the Python tier's `declared_status`, so the two tiers describe this the
  * same way.
@@ -663,19 +744,25 @@ function declaredStatus(document) {
  * a health probe must stay lightweight and perform no heavy work, because a probe
  * that does real work becomes a source of the very load it is meant to report on.
  *
- * @type {Readonly<{name: string, version: string, host: string, port: number, path: string}>}
+ * @type {Readonly<{name: string, version: string, host: string, port: number, path: string, status: string}>}
  */
-const { values: config, degradations: configDegradations } = loadConfig();
+const {
+  values: config,
+  sources: configSources,
+  degradations: configDegradations,
+} = loadConfig();
 
 /**
  * Frozen-value declarations that were rejected, computed once at module load.
  *
  * Empty for the configuration this repository ships, because `config/health.json`
- * restates both frozen values exactly. A non-empty array means the deployed
- * configuration tried to redefine the contract: the endpoint still serves the
- * frozen values — that is the whole point — and `server.js` prints one warning
- * line per entry at start-up so the mismatch is visible to whoever caused it
- * rather than being discovered later as a monitoring outage.
+ * restates both frozen values exactly — and because they match, both are *adopted*
+ * from the file rather than merely tolerated, which {@link configSources} reports
+ * as `file`. A non-empty array means the deployed configuration tried to redefine
+ * the contract: the endpoint still serves the frozen values — that is the whole
+ * point — the provenance of the rejected value reads `fallback`, and `server.js`
+ * prints one warning line per entry at start-up so the mismatch is visible to
+ * whoever caused it rather than being discovered later as a monitoring outage.
  *
  * @type {ReadonlyArray<Readonly<{key: string, configured: string, frozen: string}>>}
  */
@@ -796,12 +883,13 @@ function currentTimestamp() {
  * `uptime`, `pid`, `hostname`, `releaseId`, `description` or `checks` object: a
  * frozen contract with an extension point is a contract with a drift point.
  *
- * `name` and `version` come from the configuration resolved at module load and
- * `status` is the compiled-in {@link STATUS_UP} constant — never a configuration
- * value, so no deployment can make a running process report anything else. It is
- * referenced directly here rather than through {@link config}, so that the
- * payload's independence from configuration is visible at the point the payload is
- * built.
+ * All three stable members come from the configuration resolved once at module
+ * load, so nothing is hard-coded at this point of use. `status` reaches
+ * {@link config} only through {@link resolveFrozenValue}, which adopts a declared
+ * value only when it is exactly {@link STATUS_UP} and rejects every other, so this
+ * member is simultaneously read from its declared source *and* impossible for a
+ * deployment to change: `config.status === STATUS_UP` holds for every
+ * configuration, valid or hostile.
  * `timestamp` is evaluated here, on every call, through {@link currentTimestamp},
  * and is what makes the response proof of *liveness* rather than merely proof of
  * reachability: a process that had frozen after binding its socket could otherwise
@@ -818,7 +906,7 @@ function buildHealthPayload() {
     name: config.name,
     version: config.version,
     timestamp: currentTimestamp(),
-    status: STATUS_UP,
+    status: config.status,
   };
 }
 
@@ -880,9 +968,10 @@ function writeJsonResponse(res, options) {
  *     at all (RFC 9112, §3.2), so `/health#x` is treated as the unknown path it
  *     literally is instead of being quietly trimmed back to `/health`.
  *
- * The result is compared for exact equality against {@link FROZEN_PATH}, so a
- * `null` return and any other spelling both route to the contract's `404`. The
- * function reads nothing, allocates at most one substring and cannot throw.
+ * The result is compared for exact equality against the resolved `config.path`,
+ * which {@link resolveFrozenValue} guarantees is {@link FROZEN_PATH}, so a `null`
+ * return and any other spelling both route to the contract's `404`. The function
+ * reads nothing, allocates at most one substring and cannot throw.
  *
  * @param {string|undefined} requestTarget The raw `req.url` value, which Node
  *   surfaces exactly as it appeared on the request line.
@@ -936,17 +1025,14 @@ const EXPECTED_TRANSPORT_CODES = new Set([
 const HANDLER_FAILURE_PREFIX = 'health request handler failed: ';
 
 /**
- * The three possible consequences, as fixed text.
+ * The two possible consequences, as fixed text.
  *
  * Stating which one occurred is the difference between an operator knowing what
- * the client received and guessing whether it got half a body. All three are
- * module constants, so naming the outcome costs no disclosure risk.
+ * the client received and guessing whether it got half a body. Both are module
+ * constants, so naming the outcome costs no disclosure risk.
  *
  * @type {string}
  */
-const OUTCOME_FAILED_CLOSED = '; answered 503, nothing else had been sent';
-
-/** @type {string} */
 const OUTCOME_NO_RESPONSE = '; connection closed without a response';
 
 /** @type {string} */
@@ -1060,8 +1146,8 @@ function classifyHandlerFailure(error) {
  * second exception thrown out of the request listener.
  *
  * @param {string} category Sanitized failure category.
- * @param {string} outcome One of {@link OUTCOME_FAILED_CLOSED},
- *   {@link OUTCOME_NO_RESPONSE} or {@link OUTCOME_TRUNCATED}.
+ * @param {string} outcome Either {@link OUTCOME_NO_RESPONSE} or
+ *   {@link OUTCOME_TRUNCATED}.
  * @returns {boolean} `true` when this call wrote a line.
  */
 function reportHandlerFailure(category, outcome) {
@@ -1107,51 +1193,49 @@ function destroyResponse(res) {
 }
 
 /**
- * Last-resort completion path for a failure the handler has no defined response
- * for.
+ * Completion path for a failure the handler has no defined response for.
  *
- * **Not part of the contract, and not uniform across the sibling applications.**
- * The contract defines exactly three responses — `200`, `405` and `404` — and no
- * `5xx`, because a routed request performs no I/O and so has no failure path: it
- * reads one already-resolved value set and one clock. This branch is therefore
- * unreachable on every contract path, and what it emits is an
- * implementation-specific, non-normative detail of this runtime rather than
- * behaviour a consumer may rely on. The sibling tiers make the same
- * no-5xx-in-the-contract promise and each fails closed in the way its own runtime
- * allows.
+ * **No status is invented here, and that is the whole design.** The contract
+ * defines exactly three responses — `200`, `405` and `404` — because a routed
+ * request performs no I/O and so has no failure path: it reads one
+ * already-resolved value set and one clock. This branch is therefore unreachable
+ * on every contract path, and a fault reaching it must not be answered with a
+ * status the contract does not contain. All three tiers behave identically: report
+ * the fault server-side, then complete the exchange at the transport level.
  *
  * It exists at all so that an exception can never escape the request listener: an
  * escaping exception would either crash the process (turning a health endpoint
  * into an outage) or leave the client waiting on a socket that is never answered.
  *
- * Two things it deliberately does not do, both of which it used to:
+ * Four things it deliberately does not do:
  *
- *   - **It no longer answers `404`.** A `404` is a statement about the *client's*
+ *   - **It never answers `404`.** A `404` is a statement about the *client's*
  *     request target — "the resource you asked for does not exist here" — so
  *     returning it after an internal failure attributes this process's defect to
  *     the caller. A poller would record a clean, contract-shaped `404`, a human
  *     would go looking for a typo in a URL that was in fact correct, and the real
- *     defect would leave no trace anywhere. A route miss and an internal fault are
- *     different facts and must not be reported with the same status; where a status
- *     can still be chosen, `503` is the honest one.
- *   - **It no longer fails silently.** Closing the connection is the honest
- *     transport-level outcome when nothing can be written, but on its own it is
- *     indistinguishable from a network blip. The failure is therefore recorded
- *     server-side, so the operator sees the cause and the client is never sent a
+ *     defect would leave no trace anywhere.
+ *   - **It never answers `2xx`.** A fault must never be reported as health.
+ *   - **It never invents a `5xx` either.** A status outside the contract is a
+ *     status a probe would have to be taught about, and teaching a probe about a
+ *     response that only a defect can produce is how an out-of-contract code ends
+ *     up being relied on. Closing the connection is the honest transport-level
+ *     outcome, and a probe already treats it as unhealthy.
+ *   - **It never fails silently.** Closing the connection on its own is
+ *     indistinguishable from a network blip, so the failure is recorded
+ *     server-side: the operator sees the cause, and the client is never sent a
  *     fabricated success.
  *
- * The resulting behavior, by what the client has already received: nothing yet — a
- * `503` with a compact JSON body; a response in flight — it is ended, because the
- * status line cannot be retracted; a response that can no longer be written to —
- * the connection is destroyed. An expected peer disconnect says nothing on stderr;
- * a genuine defect emits one sanitized line naming the category and the
- * consequence. In no case is any exception detail reflected to the client.
+ * The resulting behavior, by what the client has already received: nothing yet —
+ * the connection is destroyed without a status line; a response in flight — it is
+ * ended, because the status line cannot be retracted. An expected peer disconnect
+ * says nothing on stderr; a genuine defect emits one sanitized line naming the
+ * category and the consequence. In no case is any exception detail reflected to
+ * the client.
  *
  * This is the internal-fault policy of `docs/health-endpoint.md` §9.3.1, which is
- * canonical for all three tiers: report server-side, never `404` and never `2xx`,
- * fail closed in the way the runtime allows, reflect nothing. The `503` is not part
- * of the contract's normal vocabulary — no routed request can elicit one — so no
- * probe or workflow may treat it as an expected response.
+ * canonical for all three tiers: report server-side, never `404`, never `2xx`,
+ * never a status outside the contract, reflect nothing.
  *
  * @param {import('node:http').ServerResponse} res Response to finalize.
  * @param {unknown} [error] The caught value, used only for classification and
@@ -1164,25 +1248,6 @@ function finalizeAfterUnexpectedError(res, error) {
   // real `ServerResponse` (a hand-rolled test double) is treated as "nothing sent".
   const headersSent = Boolean(res) && res.headersSent === true;
   const category = classifyHandlerFailure(error);
-
-  if (!headersSent) {
-    try {
-      // Nothing is on the wire, so a status can still be chosen, and `503` is the
-      // only honest one: something inside this process is broken.
-      writeJsonResponse(res, {
-        statusCode: STATUS_SERVICE_UNAVAILABLE,
-        json: SERVICE_UNAVAILABLE_BODY,
-      });
-      if (category !== null) {
-        reportHandlerFailure(category, OUTCOME_FAILED_CLOSED);
-      }
-      return;
-    } catch {
-      // The response is unusable — its socket was torn down mid-flight — so no
-      // status reached the client after all. Fall through to the transport-level
-      // close, and report that as the consequence rather than the `503`.
-    }
-  }
 
   if (category !== null) {
     reportHandlerFailure(category, headersSent ? OUTCOME_TRUNCATED : OUTCOME_NO_RESPONSE);
@@ -1258,7 +1323,7 @@ function handleRequest(req, res) {
       return;
     }
 
-    if (requestTargetPath(req.url) !== FROZEN_PATH) {
+    if (requestTargetPath(req.url) !== config.path) {
       writeJsonResponse(res, { statusCode: STATUS_NOT_FOUND, json: NOT_FOUND_BODY, omitBody });
       return;
     }
@@ -1294,18 +1359,23 @@ function createHealthServer() {
  * Public surface consumed by `server.js` (the entry point) and `index.test.js`
  * (the unit suite).
  *
- * `config` is the single resolved source of the serving values; `name`,
- * `version`, `host`, `port` and `path` mirror its members at the top level, and
+ * `config` is the single resolved source of every served value; `name`, `version`,
+ * `host`, `port`, `path` and `status` mirror its members at the top level, and
  * `healthPath` / `HEALTH_PATH` name the resource path under the two other
  * conventions a consumer may reasonably expect. Every one of those is the same
  * already-resolved value — there is no second resolution and no drift.
  *
- * `status` and `STATUS_UP` are the same compiled-in protocol constant, exported
- * under both names and deliberately *not* a member of `config`: it is not a
- * setting, so it does not appear among the resolved settings, and no consumer
- * should be able to read it as though it were one. `declaredStatus` is exported
- * alongside them so that a caller can still inspect what a configuration file
- * declared, without that declaration ever influencing what is served.
+ * `configSources` reports which link of each chain supplied each resolved value,
+ * which is what makes the declared-source-to-runtime mapping assertable. For
+ * `path` and `status` it is the only way to tell an adopted declaration (`file`)
+ * from an absent or rejected one (`fallback`), because the only legal declaration
+ * for either is by definition equal to the fallback.
+ *
+ * `STATUS_UP` is the contract's literal for the status member, exported so a
+ * consumer can compare the resolved `config.status` against the contract rather
+ * than against a string it retyped. `declaredStatus` reports what a document
+ * declares *before* validation, so a caller can distinguish "declared and adopted"
+ * from "declared and refused".
  *
  * The diagnostics surface — `configDegradations`,
  * `describeConfigurationDegradation` and `reportedHandlerFailures` — exists so
@@ -1322,9 +1392,10 @@ function createHealthServer() {
  * be asserted directly: the first proves that two immediate calls differ, and the
  * second renders a chosen instant so the whole-second case is deterministic.
  *
- * `frozenValueConflicts` is the audit trail for the two values configuration may
- * not redefine: empty in a correctly configured deployment, and one descriptor
- * per rejected declaration otherwise. `server.js` turns it into start-up warnings.
+ * `frozenValueConflicts` is the audit trail for the two values a deployment may
+ * declare but not redefine: empty in a correctly configured deployment, and one
+ * descriptor per rejected declaration otherwise. `server.js` turns it into
+ * start-up warnings.
  */
 module.exports = {
   buildHealthPayload,
@@ -1335,6 +1406,7 @@ module.exports = {
   requestTargetPath,
   declaredStatus,
   config,
+  configSources,
   configDegradations,
   describeConfigurationDegradation,
   reportedHandlerFailures,
@@ -1344,7 +1416,7 @@ module.exports = {
   host: config.host,
   port: config.port,
   path: config.path,
-  status: STATUS_UP,
+  status: config.status,
   STATUS_UP,
   healthPath: config.path,
   HEALTH_PATH: config.path,

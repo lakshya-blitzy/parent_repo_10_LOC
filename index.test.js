@@ -26,16 +26,20 @@
  *      RFC 3339 UTC timestamp that is provably fresh, compact serialization, and
  *      the two negative paths — `405` with `Allow: GET, HEAD`, and `404` — with the
  *      method checked before the path, so `POST /unknown` is a `405`.
- *   D. **The two values configuration may not redefine.** The resource path and the
- *      `status` literal are contract constants. This group loads `health.js` in a
- *      child process behind an injected loader that returns a hostile serving
- *      document, and proves the endpoint still routes on `/health` and still
- *      reports `UP` — while asserting that the two genuinely configurable values in
- *      that same document, host and port, *did* change, so the group cannot pass
- *      vacuously. Every rejected value is asserted to be reported rather than
- *      discarded in silence. A second sub-group proves the stronger property that
- *      holds for `status`: a document declaring some other value cannot even create
- *      the member, because `status` is never among the resolved settings.
+ *   D. **The two values configuration may declare but not redefine.** The resource
+ *      path and the `status` literal are read from the serving document like every
+ *      other setting, but validated against the contract before they are adopted:
+ *      a declaration that restates the literal is taken from the file, and anything
+ *      else is refused in favour of the literal and recorded as a conflict. This
+ *      group loads `health.js` in a child process behind an injected loader that
+ *      returns a hostile serving document, and proves the endpoint still routes on
+ *      `/health` and still reports `UP` — while asserting that the two freely
+ *      configurable values in that same document, host and port, *did* change, so
+ *      the group cannot pass vacuously. The exported provenance is asserted
+ *      alongside every value, so an adoption and a refusal are told apart rather
+ *      than inferred from a value that happens to look right, and a second
+ *      sub-group asserts both directions for `status`: a legal declaration is
+ *      adopted from the file, an illegal one falls back and is reported.
  *   E. **One resource, one spelling**, asserted against the routing decision
  *      directly and then again with request lines written to a socket by hand.
  *      `/health` is the only spelling of the resource: a percent-encoded,
@@ -46,25 +50,25 @@
  *   F. **Configuration resilience, and a fallback that is never silent.** The
  *      documented precedence chain ends in a compiled-in literal, and that last
  *      link is a contract requirement rather than a nicety: the endpoint must still
- *      serve when its configuration is absent from a container image. So a copy of
- *      `health.js` is loaded from a private temporary directory whose identity and
- *      serving sources are missing, malformed, not JSON objects, or carry values of
- *      the wrong type; every resolved value is asserted to be the documented
- *      literal; the recorded reason for each substitution is asserted alongside it;
- *      and that reason is asserted once more as the single line `server.js` writes
- *      at start-up.
+ *      serve when its configuration cannot be read at all. So a copy of `health.js`
+ *      is loaded from a private temporary directory whose identity and serving
+ *      sources are missing, malformed, not JSON objects, or carry values of the
+ *      wrong type; every resolved value is asserted to be the documented literal;
+ *      the recorded reason for each substitution is asserted alongside it; and that
+ *      reason is asserted once more as the single line `server.js` writes at
+ *      start-up.
  *   G. **Diagnostics that can be neither misattributed nor forged.** An unexpected
  *      handler failure must be reported as what it is rather than rendered as a
  *      misleading `404`, an expected transport error — a peer that hung up — must
  *      not be reported at all, and a configuration-derived host carrying a newline
  *      must never be able to write a second log line that reads like this server's
  *      own start-up announcement.
- *   H. **The process entry point.** `server.js` is the long-lived process a
- *      container runs, so it is exercised as a real child process: bind-target
- *      resolution, the single announced start-up line, the contract served over the
- *      announced port, prompt `SIGTERM`/`SIGINT` shutdown with exit `0` and a
- *      released port, and an actionable diagnostic with exit `1` when the port is
- *      already taken.
+ *   H. **The process entry point.** `server.js` calls `start()` at load and exports
+ *      nothing, so a real child process is the only honest way to exercise it:
+ *      bind-target resolution, the single announced start-up line, the contract
+ *      served over the announced port, prompt `SIGTERM`/`SIGINT` shutdown with exit
+ *      `0` and a released port, and an actionable diagnostic with exit `1` when the
+ *      port is already taken.
  *
  * Freshness is asserted between **immediately consecutive** calls and responses,
  * with no delay inserted anywhere. That is deliberate: inserting a wait past a
@@ -166,13 +170,6 @@ const PAYLOAD_KEYS = Object.freeze(['name', 'version', 'timestamp', 'status']);
 const TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const NOT_FOUND_BODY = '{"error":"Not Found"}';
 const METHOD_NOT_ALLOWED_BODY = '{"error":"Method Not Allowed"}';
-
-// The contract defines no 5xx, and no routed request can produce one. These two are
-// the deliberately non-normative answer this runtime fails closed with when an
-// internal fault happens before anything has been written — asserted here only so
-// that the fault path cannot silently go back to answering `404`.
-const STATUS_SERVICE_UNAVAILABLE = 503;
-const SERVICE_UNAVAILABLE_BODY = '{"error":"Service Unavailable"}';
 
 /**
  * Request targets and the path each one must yield, or `null` for no path at all.
@@ -466,6 +463,17 @@ const FORBIDDEN_IN_DIAGNOSTICS = Object.freeze([
 
 /** Loopback interface. A probe asserts the state of *this* process, so it addresses `127.0.0.1`. */
 const LOOPBACK = '127.0.0.1';
+
+/**
+ * The operating system's "assign me any free port" sentinel.
+ *
+ * Usable only where the *suite itself* binds the listener, because a resolved
+ * configuration port of `0` is rejected at every tier: a health endpoint whose port
+ * the operating system chose cannot be addressed by a container `HEALTHCHECK`, a
+ * workflow probe or an orchestrator, all of which are configured with a fixed
+ * number. Anything that has to reach a *child's* listener therefore reserves a
+ * concrete number with {@link reserveFreePort} instead.
+ */
 const EPHEMERAL_PORT = 0;
 
 // Upper bound on a child process, so a hung child fails the run with a clear
@@ -519,9 +527,9 @@ const CLOCK_TRACKING_CEILING_MS = 3000;
  *
  * `fetch` has no default timeout, so an unbounded call against a stalled handler or
  * a socket that is never answered waits forever: the run hangs instead of failing,
- * and a product defect becomes an indefinitely blocked pipeline with no diagnosis.
- * Ten seconds is orders of magnitude beyond the sub-millisecond work this endpoint
- * performs, so the bound can only ever be reached by a real fault.
+ * and a product defect becomes a stalled run with no diagnosis. Ten seconds is
+ * orders of magnitude beyond the sub-millisecond work this endpoint performs, so the
+ * bound can only ever be reached by a real fault.
  */
 const REQUEST_TIMEOUT_MS = 10000;
 
@@ -637,8 +645,8 @@ function childEnvironment(overrides = {}) {
  *
  * Every socket request in this suite goes through here. `fetch` has no default
  * timeout, so an unbounded call is an unbounded wait: a handler that never answers
- * would stall `node --test` indefinitely and the pipeline would report a hang rather
- * than a failure. `AbortSignal.timeout` converts that into a deterministic failure,
+ * would stall `node --test` indefinitely, reporting a hang rather than a failure.
+ * `AbortSignal.timeout` converts that into a deterministic failure,
  * and the abort is translated into a message that names the method, the URL and the
  * bound, so the log says what timed out rather than only that something did.
  *
@@ -762,8 +770,8 @@ function buildTierCopy(label, identity, serving) {
  *
  * @param {string} modulePath Absolute path to a copied `health.js`.
  * @param {Object<string, string>} [environmentOverrides] Layered environment.
- * @returns {{degradations: string[], line: string|null, values: Object<string, unknown>}}
- *   The child's reported surface.
+ * @returns {{degradations: string[], line: string|null, values: Object<string, unknown>,
+ *   sources: Object<string, string>, conflicts: Array<Object>}} The child's reported surface.
  */
 function loadDiagnostics(modulePath, environmentOverrides = {}) {
   const expression =
@@ -774,6 +782,8 @@ function loadDiagnostics(modulePath, environmentOverrides = {}) {
     'line: h.describeConfigurationDegradation(),' +
     'reported: h.reportedHandlerFailures(),' +
     'values: h.config,' +
+    'sources: h.configSources,' +
+    'conflicts: h.frozenValueConflicts,' +
     'status: h.STATUS_UP,' +
     'payloadStatus: h.buildHealthPayload().status,' +
     'payloadKeys: Object.keys(h.buildHealthPayload()),' +
@@ -1142,6 +1152,27 @@ function occupyEphemeralPort() {
 }
 
 /**
+ * Reserve a concrete free loopback port number and release it again.
+ *
+ * A resolved configuration port of `0` is rejected at every tier — an endpoint on an
+ * operating-system-assigned port cannot be addressed by a `HEALTHCHECK`, a workflow
+ * probe or an orchestrator — so a test that needs a *child* to bind a listener it can
+ * then reach must supply a real number. Asking the operating system for one and
+ * handing it back is how that number is obtained without hardcoding a guess that
+ * could collide with something already running on the host.
+ *
+ * The listener is closed before the number is returned, so the caller receives a port
+ * that is free rather than one this process is holding.
+ *
+ * @returns {Promise<number>} A port number that was free a moment ago.
+ */
+async function reserveFreePort() {
+  const { server, port } = await occupyEphemeralPort();
+  await new Promise((resolve) => server.close(resolve));
+  return port;
+}
+
+/**
  * Attempt one TCP connection and report how it ended.
  *
  * Resolves with `'connected'` when the port accepts, or with the error code when it
@@ -1237,7 +1268,8 @@ function createIsolatedTier(files = {}) {
 function loadIsolatedTier(directory, environmentOverrides = {}) {
   const script =
     `const health = require(${JSON.stringify(path.join(directory, 'health.js'))});` +
-    'process.stdout.write(JSON.stringify({ config: health.config, payload: health.buildHealthPayload() }));';
+    'process.stdout.write(JSON.stringify({ config: health.config, sources: health.configSources,' +
+    ' conflicts: health.frozenValueConflicts, payload: health.buildHealthPayload() }));';
 
   // HOST and PORT are cleared unless a case sets them, so the two values that do
   // accept an environment override are determined by the case rather than inherited
@@ -1570,33 +1602,34 @@ describe('health.js — the /health payload contract', () => {
     assert.strictEqual(payload.version, manifest.version);
   });
 
-  test('status is a compiled-in protocol constant, never a configuration input', () => {
+  test('status is resolved from the declared source and validated against the contract', () => {
     const payload = health.buildHealthPayload();
 
-    // The first assertion is the contract: the value is the frozen literal,
-    // hard-coded in the handler. The second proves the shipped configuration
-    // agrees with it — `config/health.json` declares `status` so an operator can
-    // read the whole shape of what is served in one place, and a declaration that
-    // disagreed would be rejected rather than served (see the frozen-contract
-    // group below).
+    // The first assertion is the contract: the reported value is the contract's
+    // literal. The second proves the payload serves the *resolved* value rather
+    // than a second copy written at the point of use, so there is one place in the
+    // tier where the value is decided.
     assert.strictEqual(payload.status, STATUS_LITERAL);
-    assert.strictEqual(payload.status, health.STATUS_UP, 'the payload must use the exported constant');
+    assert.strictEqual(payload.status, health.config.status, 'the payload must serve the resolved value');
+    assert.strictEqual(health.config.status, health.STATUS_UP, 'the resolved value must be the contract literal');
 
-    // The direction of this dependency is the whole point. `status` is what every
-    // consumer branches on, so it is compiled in: a deployment that edited its
-    // configuration file could otherwise publish "DOWN" — or any other string —
-    // from a process that is running perfectly well, and two tiers of this
-    // composition could disagree about the one value that matters. The resolved
-    // configuration therefore carries no `status` member at all.
+    // And the chain is real, not decorative: `config/health.json` declares
+    // `status`, that declaration is what was adopted, and the provenance says so.
+    // A dead declaration would report `fallback` here even though the value looked
+    // right, which is the failure this assertion exists to catch.
     assert.strictEqual(
-      health.config.status,
-      undefined,
-      'status must not be a member of the resolved serving configuration',
+      health.configSources.status,
+      'file',
+      'the shipped status declaration must be the value that was adopted',
     );
-    assert.ok(
-      !Object.prototype.hasOwnProperty.call(health.config, 'status'),
-      'status must not be resolved from any configuration source',
-    );
+
+    // What makes adopting it safe is the validation, not the source: the contract
+    // admits exactly one legal declaration, so `config.status` cannot become
+    // anything else. A deployment that edited its configuration file could
+    // otherwise publish "DOWN" — or any other string — from a process that is
+    // running perfectly well, and two tiers of this composition could disagree
+    // about the one value that matters. The frozen-contract group below proves the
+    // refusal end to end.
 
     // The configuration file still *declares* the literal, for documentation of
     // the contract it serves, and this pins the declaration to the constant so the
@@ -1605,10 +1638,10 @@ describe('health.js — the /health payload contract', () => {
     assert.strictEqual(health.STATUS_UP, servingConfig.status);
   });
 
-  test('the serving file declares status, and the declaration is powerless', () => {
-    // Both halves matter. The declared shape must still carry `status`, because
-    // the contract quotes it and a consumer reading the file expects it; and the
-    // reported value must be reachable only from the compiled-in literal.
+  test('the serving file declares status, and an illegal declaration is powerless', () => {
+    // Both halves matter. The declared shape must still carry `status`, because the
+    // contract quotes it and a consumer reading the file expects it; and only a
+    // declaration equal to the contract's literal may ever be adopted.
     assert.strictEqual(health.declaredStatus(servingConfig), STATUS_LITERAL);
 
     // A document declaring anything else is read faithfully...
@@ -1621,7 +1654,8 @@ describe('health.js — the /health payload contract', () => {
     assert.strictEqual(health.declaredStatus(null), null);
     assert.strictEqual(health.declaredStatus(undefined), null);
 
-    // ...while what the endpoint reports never moves.
+    // ...while what the endpoint reports never moves. Reading a declaration and
+    // adopting it are separate steps, and only the second is gated by the contract.
     assert.strictEqual(health.buildHealthPayload().status, STATUS_LITERAL);
   });
 
@@ -1777,10 +1811,20 @@ describe('health.js — the /health payload contract', () => {
     assert.strictEqual(health.config.version, TIER_VERSION);
     assert.deepStrictEqual(
       Object.keys(health.config).sort(),
-      ['host', 'name', 'path', 'port', 'version'],
-      'the resolved configuration carries the serving values and identity only',
+      ['host', 'name', 'path', 'port', 'status', 'version'],
+      'the resolved configuration carries every served value: identity, bind target, path and status',
     );
-    assert.strictEqual(health.status, STATUS_LITERAL, 'the status constant is exported at the top level');
+    assert.strictEqual(health.status, STATUS_LITERAL, 'the resolved status is exported at the top level');
+
+    // Every one of those six values was read from a declared source rather than
+    // written inline at its point of use, and the provenance map says which source.
+    // With both files present and valid, no value may report `fallback`.
+    assert.deepStrictEqual(
+      health.configSources,
+      { name: 'file', version: 'file', host: 'file', port: 'file', path: 'file', status: 'file' },
+      'with both declared sources present and valid, every value must come from a file',
+    );
+    assert.ok(Object.isFrozen(health.configSources), 'the provenance map must be immutable');
   });
 
   test('the identity manifest keeps this tier resolvable as CommonJS with no dependencies', () => {
@@ -1819,16 +1863,18 @@ describe('health.js — documented configuration precedence', () => {
     assert.strictEqual(config.host, LOOPBACK, 'HOST must take precedence over the configuration file');
 
     // Identity is a declared fact of the build, not a runtime setting, so no
-    // environment variable may change what the payload claims to be. The status is
-    // stronger still: it has no source outside `health.js` at all, which Group C.3
-    // proves against a file that declares something else.
+    // environment variable may change what the payload claims to be. `path` and
+    // `status` are resolved settings, but only the declared *file* may supply them
+    // and only when it restates the contract literal, so an environment variable
+    // cannot reach them either — there is no `HEALTH_PATH` or `HEALTH_STATUS`
+    // variable to set. Group C.3 proves the file cannot move them either.
     assert.strictEqual(config.name, TIER_NAME);
     assert.strictEqual(config.version, TIER_VERSION);
-    assert.strictEqual(config.path, HEALTH_PATH);
+    assert.strictEqual(config.path, HEALTH_PATH, 'no environment variable may move the resource path');
     assert.strictEqual(
       config.status,
-      undefined,
-      'no environment variable may introduce a status into the resolved configuration',
+      STATUS_LITERAL,
+      'no environment variable may change the reported status',
     );
   });
 
@@ -1867,13 +1913,46 @@ describe('health.js — documented configuration precedence', () => {
     assert.strictEqual(config.host, servingConfig.host);
   });
 
+  test('a configured port of 0 is rejected, because an assigned port cannot be probed', () => {
+    // `0` is a legal argument to `listen`, so it would otherwise resolve cleanly and
+    // bind whatever port the operating system handed out. That is precisely wrong for
+    // this endpoint: every consumer of it — a fixed-number probe, an orchestrator
+    // liveness check — is configured with a port in advance, and cannot discover one
+    // chosen at bind time. All three tiers reject it identically, so `0` never
+    // becomes a resolved configuration value anywhere in the composition.
+    const fromEnvironment = JSON.parse(
+      runNode(['-e', printConfig], { PORT: '0', HOST: null }).stdout.toString('utf8'),
+    );
+    assert.strictEqual(fromEnvironment.port, TIER_DEFAULT_PORT, 'PORT=0 must fall through, not resolve');
+
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'blitzy-health-port-zero-'));
+    try {
+      fs.mkdirSync(path.join(workspace, 'config'));
+      fs.copyFileSync(path.join(__dirname, 'health.js'), path.join(workspace, 'health.js'));
+      fs.copyFileSync(path.join(__dirname, 'package.json'), path.join(workspace, 'package.json'));
+      fs.writeFileSync(
+        path.join(workspace, 'config', 'health.json'),
+        JSON.stringify({ ...servingConfig, port: 0 }),
+      );
+
+      const script = `const h = require(${JSON.stringify(path.join(workspace, 'health.js'))});`
+        + 'process.stdout.write(JSON.stringify({ port: h.config.port, source: h.configSources.port }));';
+      const fromFile = JSON.parse(runNode(['-e', script], { PORT: null, HOST: null }).stdout.toString('utf8'));
+
+      assert.strictEqual(fromFile.port, TIER_DEFAULT_PORT, 'a declared port of 0 must fall through to the literal');
+      assert.strictEqual(fromFile.source, 'fallback', 'and the provenance must say the declaration was not used');
+    } finally {
+      fs.rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
   test('a configuration file declaring a different status cannot change the payload', () => {
-    // The strongest form of the "status is not configurable" claim: build a whole
+    // The strongest form of the "status cannot be reconfigured" claim: build a whole
     // throwaway copy of this tier whose configuration file declares DOWN, load it in
-    // a fresh process, and require the payload to report UP anyway. Asserting the
-    // absence of a `status` member proves the resolution chain no longer reads one;
-    // this proves that a deployment which edits the file cannot make a running
-    // process report itself unhealthy, which is the consequence that matters.
+    // a fresh process, and require the payload to report UP anyway. The chain does
+    // read the declaration — that is what makes the file the value's declared source
+    // — but it adopts it only when it matches the contract, so a deployment that
+    // edits the file cannot make a running process report itself unhealthy.
     //
     // The copy lives in the operating system's temporary directory, never inside
     // this repository, and is removed in the `finally` block whatever happens.
@@ -1902,6 +1981,15 @@ describe('health.js — documented configuration precedence', () => {
         STATUS_LITERAL,
         `a configuration file declaring ${TAMPERED_STATUS} must not change the reported status`,
       );
+
+      // And the refusal is visible rather than silent: the provenance of a rejected
+      // declaration is the fallback, never the file.
+      const printSources = `process.stdout.write(JSON.stringify(require(${JSON.stringify(
+        path.join(workspace, 'health.js'),
+      )}).configSources));`;
+      const sources = JSON.parse(runNode(['-e', printSources]).stdout.toString('utf8'));
+      assert.strictEqual(sources.status, 'fallback', 'a rejected declaration must not be reported as adopted');
+      assert.strictEqual(sources.host, 'file', 'the legitimate members of the same document are still adopted');
     } finally {
       fs.rmSync(workspace, { recursive: true, force: true });
     }
@@ -1910,15 +1998,16 @@ describe('health.js — documented configuration precedence', () => {
 
 /*
  * ---------------------------------------------------------------------------
- * Group D.1 — the two values configuration may not redefine
+ * Group D.1 — the two values configuration may declare but not redefine
  *
- * `/health` and `UP` are contract constants rather than settings. A serving
- * document that names anything else must be rejected, not honoured: a settable
- * path would move the endpoint away from where every workflow assertion and every
- * container HEALTHCHECK in this composition looks for it, and a settable status
- * would let a deployment report a value its own behavior does not support. Both
- * failures leave a response that is still syntactically valid, which is what makes
- * them worth asserting rather than assuming.
+ * `/health` and `UP` are resolved from the serving document like every other
+ * setting, but their declarations are validated against the contract first: only
+ * the contract's own literal may be adopted, and a document that names anything
+ * else must be rejected rather than honoured. A settable path would move the
+ * endpoint away from where a probe addresses it, and a settable status would let a
+ * deployment report a value its own behavior does not support. Both failures leave
+ * a response that is still syntactically valid, which is what makes them worth
+ * asserting rather than assuming.
  *
  * Each test loads the module in a child process behind an injected loader, so the
  * resolution genuinely happens against the hostile document. Each one also asserts
@@ -1930,7 +2019,8 @@ describe('health.js — documented configuration precedence', () => {
 describe('health.js — the frozen contract cannot be reconfigured', () => {
   test('a hostile serving document cannot move the resource path or change the status', () => {
     const observed = runWithHostileServingConfig(
-      'process.stdout.write(JSON.stringify({ config: health.config, payload: health.buildHealthPayload() }));',
+      'process.stdout.write(JSON.stringify({ config: health.config, sources: health.configSources,'
+        + ' payload: health.buildHealthPayload() }));',
     );
 
     // Positive control first: without this, every assertion below would also hold
@@ -1949,15 +2039,21 @@ describe('health.js — the frozen contract cannot be reconfigured', () => {
     assert.strictEqual(observed.config.path, HEALTH_PATH, 'the resource path is frozen');
     assert.notStrictEqual(observed.config.path, HOSTILE_SERVING_CONFIG.path);
 
-    // `status` is frozen one step harder than `path`: it is not merely resolved to
-    // the constant despite the document, it is never a resolved setting at all, so
-    // there is no member here for a document to have influenced.
+    // `status` is validated exactly as strictly as `path`, so the resolved setting
+    // is the contract's literal even though the document named something else.
     assert.strictEqual(
       observed.config.status,
-      undefined,
-      'status is a compiled-in protocol constant, never one of the resolved settings',
+      STATUS_LITERAL,
+      'an illegal status declaration must resolve to the contract literal',
     );
     assert.notStrictEqual(observed.config.status, HOSTILE_SERVING_CONFIG.status);
+
+    // Both refusals are recorded in the provenance rather than hidden behind a
+    // value that happens to look right.
+    assert.strictEqual(observed.sources.path, 'fallback');
+    assert.strictEqual(observed.sources.status, 'fallback');
+    assert.strictEqual(observed.sources.host, 'file', 'the document\'s legitimate members are still adopted');
+    assert.strictEqual(observed.sources.port, 'file');
 
     // The payload is what a consumer actually sees, so it is asserted separately
     // from the resolved configuration rather than inferred from it.
@@ -2017,21 +2113,23 @@ describe('health.js — the frozen contract cannot be reconfigured', () => {
 
 /*
  * ---------------------------------------------------------------------------
- * Group D.2 — the reported status is not configurable
+ * Group D.2 — a declared status is validated, never trusted
  *
  * Group D.1 proves a hostile document cannot move the resource path. This group
- * proves the same property for the other frozen value, and it does so one step
- * further out: not merely that a hostile declaration is ignored, but that the value
- * is never among the resolved settings at all.
+ * proves the same property for the other validated value, and it proves both
+ * halves of that property: the declaration really is read, and a declaration that
+ * is not the contract's literal is refused in favour of the compiled-in fallback.
  *
- * Asserting that the reported status equals `UP` cannot establish this on its own.
- * It passes just as happily for an implementation that reads `status` out of a file
- * that happens to declare `UP` — which is what the repository's own
- * `config/health.json` does. The only assertion that distinguishes the two is a
- * configuration file that declares something *else*, so that is what this group
- * builds: a private workspace outside the repository holding a copy of `health.js`,
- * a copy of `package.json` so identity still resolves normally, and a
- * `config/health.json` identical to the real one except for `status`.
+ * Asserting that the reported status equals `UP` cannot establish either half on
+ * its own. It passes just as happily for an implementation that never reads the
+ * file, and just as happily for one that echoes whatever the file says — because
+ * the repository's own `config/health.json` declares `UP`. The only assertion that
+ * separates the three is a configuration file that declares something *else*, so
+ * that is what this group builds: a private workspace outside the repository
+ * holding a copy of `health.js`, a copy of `package.json` so identity still
+ * resolves normally, and a `config/health.json` identical to the real one except
+ * for `status`. Provenance is asserted alongside the value, so a refusal is
+ * visibly a refusal rather than a coincidence.
  *
  * The module is loaded in a child process, because resolution happens once at
  * module load and this process has already loaded the real module. Nothing inside
@@ -2040,7 +2138,7 @@ describe('health.js — the frozen contract cannot be reconfigured', () => {
  * ---------------------------------------------------------------------------
  */
 
-describe('health.js — the reported status is not configurable', () => {
+describe('health.js — a declared status is validated, never trusted', () => {
   /** A status no conforming implementation may ever report. */
   const HOSTILE_STATUS = 'DOWN';
 
@@ -2084,8 +2182,8 @@ describe('health.js — the reported status is not configurable', () => {
    * only be about that.
    *
    * @param {string} declared The status to write into the temporary serving file.
-   * @returns {{config: Object, payload: Object, declared: string|null, status: string}}
-   *   What the freshly loaded copy reports.
+   * @returns {{config: Object, sources: Object, payload: Object, declared: string|null,
+   *   status: string, conflicts: Array<Object>}} What the freshly loaded copy reports.
    */
   function loadWithDeclaredStatus(declared) {
     const home = fs.mkdtempSync(path.join(workspace, 'case-'));
@@ -2100,9 +2198,11 @@ describe('health.js — the reported status is not configurable', () => {
     const expression = `const h = require(${JSON.stringify(path.join(home, 'health.js'))});
       process.stdout.write(JSON.stringify({
         config: h.config,
+        sources: h.configSources,
         payload: h.buildHealthPayload(),
         declared: h.declaredStatus(require(${JSON.stringify(servingPath)})),
         status: h.status,
+        conflicts: h.frozenValueConflicts,
       }));`;
     const result = runNode(['-e', expression]);
 
@@ -2118,17 +2218,24 @@ describe('health.js — the reported status is not configurable', () => {
     return reported;
   }
 
-  test('a declared status is read faithfully but never reported', () => {
+  test('a declared status is read faithfully but refused when it is not the literal', () => {
     const reported = loadWithDeclaredStatus(HOSTILE_STATUS);
 
     assert.strictEqual(reported.declared, HOSTILE_STATUS);
-    assert.strictEqual(reported.status, STATUS_LITERAL, 'the exported status must ignore the declaration');
-    assert.strictEqual(reported.payload.status, STATUS_LITERAL, 'the payload must ignore the declaration');
+    assert.strictEqual(reported.status, STATUS_LITERAL, 'the exported status must refuse the declaration');
+    assert.strictEqual(reported.payload.status, STATUS_LITERAL, 'the payload must refuse the declaration');
     assert.strictEqual(
       reported.config.status,
-      undefined,
-      'a declaration cannot even create the member: status is not a resolved setting',
+      STATUS_LITERAL,
+      'the resolved setting is the compiled-in literal, not the declared value',
     );
+
+    // The refusal is visible rather than inferred: the provenance says the value
+    // came from the fallback, and the audit trail names what was rejected.
+    assert.strictEqual(reported.sources.status, 'fallback', 'a refused declaration must resolve as fallback');
+    assert.deepStrictEqual(reported.conflicts, [
+      { key: 'status', configured: HOSTILE_STATUS, frozen: STATUS_LITERAL },
+    ]);
   });
 
   test('an arbitrary declared status is equally powerless', () => {
@@ -2136,7 +2243,24 @@ describe('health.js — the reported status is not configurable', () => {
 
     assert.strictEqual(reported.declared, ARBITRARY_STATUS);
     assert.strictEqual(reported.payload.status, STATUS_LITERAL);
-    assert.strictEqual(reported.config.status, undefined);
+    assert.strictEqual(reported.config.status, STATUS_LITERAL);
+    assert.strictEqual(reported.sources.status, 'fallback');
+    assert.deepStrictEqual(reported.conflicts, [
+      { key: 'status', configured: ARBITRARY_STATUS, frozen: STATUS_LITERAL },
+    ]);
+  });
+
+  test('a declaration that restates the literal is adopted, and the provenance says so', () => {
+    // The counterpart to the two refusals above, and the assertion that proves the
+    // chain is live rather than decorative: with a *legal* declaration the value is
+    // taken from the file, nothing is rejected, and no fallback is involved.
+    const reported = loadWithDeclaredStatus(STATUS_LITERAL);
+
+    assert.strictEqual(reported.declared, STATUS_LITERAL);
+    assert.strictEqual(reported.config.status, STATUS_LITERAL);
+    assert.strictEqual(reported.payload.status, STATUS_LITERAL);
+    assert.strictEqual(reported.sources.status, 'file', 'a legal declaration must be adopted from the file');
+    assert.deepStrictEqual(reported.conflicts, [], 'a legal declaration is not a conflict');
   });
 
   test('the payload keeps its exact shape when a status is declared', () => {
@@ -2153,13 +2277,18 @@ describe('health.js — the reported status is not configurable', () => {
   test('the other serving values are still read from the declared document', () => {
     // Without this, an implementation that stopped reading the file altogether
     // would be indistinguishable from one that stopped reading only the status.
-    const { config } = loadWithDeclaredStatus(HOSTILE_STATUS);
+    const { config, sources } = loadWithDeclaredStatus(HOSTILE_STATUS);
 
     assert.strictEqual(config.host, servingConfig.host, 'host must still come from the document');
     assert.strictEqual(config.port, servingConfig.port, 'port must still come from the document');
-    assert.strictEqual(config.path, HEALTH_PATH, 'the resource path is the frozen constant the file restates');
+    assert.strictEqual(config.path, HEALTH_PATH, 'the resource path is the literal the file restates');
     assert.strictEqual(config.name, TIER_NAME, 'identity must still resolve from the manifest');
     assert.strictEqual(config.version, TIER_VERSION);
+
+    // One refused member must not turn the whole document into a rejected one.
+    assert.deepStrictEqual(sources, {
+      name: 'file', version: 'file', host: 'file', port: 'file', path: 'file', status: 'fallback',
+    });
   });
 });
 
@@ -2386,14 +2515,13 @@ describe('health.js — the /health contract served over a real socket', () => {
  * ---------------------------------------------------------------------------
  * Group F.1 — a configuration fallback is observable, not silent
  *
- * The failure mode these close is quiet and expensive. An image built without
- * `config/health.json`, or with the file caught by an over-broad `.dockerignore`
- * pattern, still serves a perfectly valid `200` carrying the compiled-in fallback
- * identity: the container health check goes green, CI passes, and every signal
- * says healthy while the payload no longer describes the build it came from. The
- * fallback itself is required — an endpoint that refuses to answer because of its
- * own configuration turns a running application into one that reports itself
- * unhealthy — so the fix is not to fail, it is to *say so*.
+ * The failure mode these close is quiet and expensive. A deployment that lost
+ * `config/health.json` still serves a perfectly valid `200` carrying the compiled-in
+ * fallback identity: every liveness signal reads healthy while the payload no longer
+ * describes the build it came from. The fallback itself is required — an endpoint
+ * that refuses to answer because of its own configuration turns a running
+ * application into one that reports itself unhealthy — so the fix is not to fail, it
+ * is to *say so*.
  *
  * Two properties are asserted together throughout, because either alone is
  * insufficient: the reason must be retained and reachable, and requiring the
@@ -2457,10 +2585,16 @@ describe('health.js — a degraded configuration source is recorded, never silen
       // The endpoint must still answer, which is the entire justification for the
       // fallback chain existing at all.
       assert.strictEqual(surface.values.port, TIER_DEFAULT_PORT);
-      // `status` is not a resolved setting, so it is absent from `config` however
-      // degraded a source is — and the constant is served regardless.
-      assert.strictEqual(surface.values.status, undefined);
+      // A source that cannot be parsed declares nothing, so the validated values
+      // resolve to their compiled-in literals and the provenance says `fallback`.
+      assert.strictEqual(surface.values.status, STATUS_LITERAL);
+      assert.strictEqual(surface.sources.status, 'fallback');
+      assert.strictEqual(surface.values.path, HEALTH_PATH);
+      assert.strictEqual(surface.sources.path, 'fallback');
       assert.strictEqual(surface.payloadStatus, STATUS_LITERAL);
+      // Nothing was *declared*, so nothing was rejected: a malformed source is a
+      // degradation, not a conflict.
+      assert.deepStrictEqual(surface.conflicts, []);
     }
   });
 
@@ -2519,15 +2653,22 @@ describe('health.js — a degraded configuration source is recorded, never silen
     const surface = loadDiagnostics(buildTierCopy('contract-degraded', null, null));
 
     assert.deepStrictEqual(surface.payloadKeys, [...PAYLOAD_KEYS]);
-    // The status a degraded configuration serves is the compiled-in constant, and
-    // it is not one of the resolved settings: there is nothing for a failed source
-    // to have failed to supply.
-    assert.strictEqual(surface.values.status, undefined);
+    // With no source at all, every value is the compiled-in literal and every
+    // provenance entry says so — the contract is served in full regardless.
+    assert.strictEqual(surface.values.status, STATUS_LITERAL);
     assert.strictEqual(surface.status, STATUS_LITERAL);
     assert.strictEqual(surface.payloadStatus, STATUS_LITERAL);
     assert.strictEqual(surface.values.path, HEALTH_PATH);
     assert.strictEqual(surface.values.name, TIER_NAME);
     assert.strictEqual(surface.values.version, TIER_VERSION);
+    assert.deepStrictEqual(surface.sources, {
+      name: 'fallback',
+      version: 'fallback',
+      host: 'fallback',
+      port: 'fallback',
+      path: 'fallback',
+      status: 'fallback',
+    });
   });
 
   test('an environment override still applies while a source is degraded', () => {
@@ -2561,16 +2702,19 @@ describe('server.js — the degraded-configuration start-up warning', () => {
    * Load a copied `server.js` far enough to exercise `start()`, without leaving a
    * listener behind.
    *
-   * `PORT=0` binds an ephemeral port so the run cannot collide with a real service
-   * or with a parallel test, and the child is signalled as soon as it announces
-   * itself, so nothing outlives the assertion.
+   * The port is one reserved by {@link reserveFreePort} rather than `0`: a resolved
+   * configuration port of `0` is rejected, so passing it would fall through to the
+   * tier's own 3000 and publish a service on the port an operator expects to be the
+   * real application. The child is signalled as soon as it announces itself, so
+   * nothing outlives the assertion.
    *
    * @param {string} label Case name.
    * @param {string|symbol|null} identity Manifest content or sentinel.
    * @param {string|symbol|null} serving Serving content or sentinel.
+   * @param {number} port A reserved, currently free loopback port.
    * @returns {{stdout: string, stderr: string, status: number|null}} Captured output.
    */
-  function startAndStop(label, identity, serving) {
+  function startAndStop(label, identity, serving, port) {
     const modulePath = buildTierCopy(label, identity, serving);
     const serverPath = path.join(path.dirname(modulePath), 'server.js');
     // A short, self-terminating wrapper: require the entry point, then raise
@@ -2579,7 +2723,7 @@ describe('server.js — the degraded-configuration start-up warning', () => {
     const wrapper =
       `require(${JSON.stringify(serverPath)});` +
       'setTimeout(() => { process.kill(process.pid, "SIGTERM"); }, 250);';
-    const result = runNode(['-e', wrapper], { PORT: '0', HOST: LOOPBACK });
+    const result = runNode(['-e', wrapper], { PORT: String(port), HOST: LOOPBACK });
     return {
       stdout: result.stdout.toString('utf8'),
       stderr: result.stderr.toString('utf8'),
@@ -2590,15 +2734,15 @@ describe('server.js — the degraded-configuration start-up warning', () => {
   const validManifest = JSON.stringify({ name: TIER_NAME, version: TIER_VERSION });
   const validServing = JSON.stringify({ path: HEALTH_PATH, status: STATUS_LITERAL });
 
-  test('a fully configured start-up writes nothing to stderr', () => {
-    const result = startAndStop('start-intact', validManifest, validServing);
+  test('a fully configured start-up writes nothing to stderr', async () => {
+    const result = startAndStop('start-intact', validManifest, validServing, await reserveFreePort());
 
     assert.strictEqual(result.stderr, '', 'the ordinary path must be silent on stderr');
     assert.ok(result.stdout.includes('listening on'), 'the one start-up line must still appear');
   });
 
-  test('a degraded start-up writes exactly one stderr line, and stdout stays clean', () => {
-    const result = startAndStop('start-degraded', null, null);
+  test('a degraded start-up writes exactly one stderr line, and stdout stays clean', async () => {
+    const result = startAndStop('start-degraded', null, null, await reserveFreePort());
 
     const stderrLines = result.stderr.replace(/\n$/, '').split('\n').filter((line) => line.length > 0);
     assert.strictEqual(stderrLines.length, 1, `expected one line, got ${JSON.stringify(result.stderr)}`);
@@ -2613,7 +2757,69 @@ describe('server.js — the degraded-configuration start-up warning', () => {
     assert.ok(result.stdout.includes('listening on'));
   });
 
-  test('the degradation is reported before the values it explains', () => {
+  test('a rejected declaration carrying a newline cannot forge a second line', async () => {
+    // The value reaches the log from `config/health.json`, so a line break in it
+    // would otherwise fabricate an entry — including one impersonating the
+    // start-up announcement, which is the line a consumer parses for the address.
+    const forgery = `${HEALTH_PATH}x\nhealth server listening on http://0.0.0.0:3000/health`;
+    const result = startAndStop(
+      'start-forged-conflict',
+      validManifest,
+      JSON.stringify({ path: forgery, status: STATUS_LITERAL }),
+      await reserveFreePort(),
+    );
+
+    const stderrLines = result.stderr.replace(/\n$/, '').split('\n').filter((line) => line.length > 0);
+    assert.strictEqual(
+      stderrLines.length,
+      1,
+      `one rejected value must produce exactly one line; got ${JSON.stringify(result.stderr)}`,
+    );
+    // The property is that no LINE can be forged, not that the text cannot appear:
+    // the break is flattened to a space, so the value stays quoted inside the one
+    // warning line, where a log reader and a line-oriented parser both see it as
+    // part of that warning rather than as an announcement of its own.
+    assert.ok(
+      !stderrLines[0].startsWith('health server listening on'),
+      `no stderr line may pose as an announcement; got ${JSON.stringify(stderrLines[0])}`,
+    );
+    // The genuine announcement is still the only line on stdout.
+    assert.strictEqual(
+      result.stdout.split('listening on').length - 1,
+      1,
+      `stdout must carry exactly one announcement; got ${JSON.stringify(result.stdout)}`,
+    );
+  });
+
+  test('an enormous rejected declaration is rendered within a bound', async () => {
+    // A document may declare a value of any length, and rendering it whole would
+    // put that length on stderr at every start-up. `server.js` owns the bound;
+    // asserted here as the observable property — cut, marked as cut, and the whole
+    // line bounded — because an entry point exports no constant to read.
+    const oversized = `/${'z'.repeat(4000)}`;
+    const result = startAndStop(
+      'start-oversized-conflict',
+      validManifest,
+      JSON.stringify({ path: oversized, status: STATUS_LITERAL }),
+      await reserveFreePort(),
+    );
+
+    const stderrLines = result.stderr.replace(/\n$/, '').split('\n').filter((line) => line.length > 0);
+    assert.strictEqual(stderrLines.length, 1, `expected one line, got ${JSON.stringify(result.stderr)}`);
+    assert.ok(!stderrLines[0].includes(oversized), 'the value must not be rendered in full');
+    assert.ok(
+      stderrLines[0].includes('..."'),
+      `a truncated value must be marked as truncated; got ${JSON.stringify(stderrLines[0])}`,
+    );
+    assert.ok(
+      stderrLines[0].length < 400,
+      `the whole line must stay bounded; it was ${stderrLines[0].length} characters`,
+    );
+    // Still actionable: the leading characters are what an operator recognises.
+    assert.ok(stderrLines[0].includes('/zzzz'), 'the value\'s leading characters must survive');
+  });
+
+  test('the degradation is reported before the values it explains', async () => {
     // Ordering is the difference between an operator reading "the manifest was
     // missing" then "listening as parent_repo_10_LOC" — and having to scroll back.
     const modulePath = buildTierCopy('start-order', null, null);
@@ -2627,7 +2833,7 @@ describe('server.js — the degraded-configuration start-up warning', () => {
       'setTimeout(() => { process.stderr.write = () => true;' +
       ' require("node:fs").writeSync(1, "ORDER=" + chunks.map((c) => c.split(":")[0]).join(",") + "\\n");' +
       ' process.kill(process.pid, "SIGTERM"); }, 250);';
-    const result = runNode(['-e', wrapper], { PORT: '0', HOST: LOOPBACK });
+    const result = runNode(['-e', wrapper], { PORT: String(await reserveFreePort()), HOST: LOOPBACK });
     const order = /ORDER=([a-z,]+)/.exec(result.stdout.toString('utf8'));
 
     assert.ok(order !== null, `expected an ORDER marker in ${result.stdout.toString('utf8')}`);
@@ -2643,10 +2849,10 @@ describe('server.js — the degraded-configuration start-up warning', () => {
  * Group G.1 — an unexpected handler failure is reported, and never misattributed
  *
  * Two populations of failure reach the handler's `catch`, and conflating them is
- * the defect this group locks out. A peer that hangs up mid-response is routine —
- * a `HEALTHCHECK` whose timeout expired, a load balancer that got what it needed —
- * and reporting it would produce a log that grows with poll volume and says
- * nothing. A defect in the handler is rare and must be heard.
+ * the defect this group locks out. A peer that hangs up mid-response is routine — a
+ * poller whose timeout expired, a load balancer that got what it needed — and
+ * reporting it would produce a log that grows with poll volume and says nothing. A
+ * defect in the handler is rare and must be heard.
  *
  * The load-bearing assertion is that an internal failure no longer answers `404`.
  * A `404` is a statement about the *client's* request target, so returning it after
@@ -2700,28 +2906,31 @@ describe('health.js — unexpected handler failures are reported, expected ones 
     assert.ok(stdout.routed.hasBody, 'the contract 404 still carries its JSON error body');
   });
 
-  test('a fault before anything is written fails closed with 503, not 404', () => {
+  test('a fault before anything is written writes no status at all, and never a 404', () => {
     const { stdout, stderrLines } = provokeHandlerFailures('fault-before-response');
 
-    // The complement of the test above: there, nothing could be written and the
-    // connection was closed; here a status can still be chosen, and the one chosen
-    // must distinguish "this process is broken" from "you asked for the wrong path".
-    assert.deepStrictEqual(stdout.statuses, [STATUS_SERVICE_UNAVAILABLE]);
-    assert.deepStrictEqual(stdout.bodies, [SERVICE_UNAVAILABLE_BODY]);
-    assert.ok(stdout.ended, 'the response must be completed rather than left open');
-    assert.ok(!stdout.destroyed, 'destroying a completed response would be gratuitous');
-    assert.strictEqual(stdout.headers[0]['Content-Type'], CONTENT_TYPE);
-    assert.strictEqual(stdout.headers[0]['Cache-Control'], CACHE_CONTROL);
-    assert.strictEqual(stdout.headers[0].Allow, undefined, 'only a 405 carries Allow');
+    // The contract enumerates exactly three responses — 200, 405 and 404 — so a
+    // fault must not be answered with a fourth. Nothing is written: the connection
+    // is closed, which is the honest transport-level outcome and which every probe
+    // already treats as unhealthy.
+    assert.deepStrictEqual(stdout.statuses, [], 'no status line may be written for an internal fault');
+    assert.deepStrictEqual(stdout.bodies, [], 'no body may be written either');
+    assert.ok(stdout.destroyed, 'the connection must be closed rather than left hanging');
+    assert.ok(!stdout.ended, 'no response may be completed when none could be written');
 
-    // And it is still reported server-side, with the consequence stated accurately.
+    // And it is still reported server-side, with the consequence stated accurately:
+    // a closed connection alone is indistinguishable from a network blip.
     assert.deepStrictEqual(stdout.reported, ['TypeError']);
     assert.strictEqual(stderrLines.length, 1);
     assert.ok(
-      stderrLines[0].includes('503'),
+      stderrLines[0].includes('closed without a response'),
       `the consequence must name what the client got; got ${JSON.stringify(stderrLines[0])}`,
     );
-    assertNoDisclosure(stderrLines[0], 'a fail-closed diagnostic');
+    assert.ok(
+      !/\b(4\d\d|5\d\d)\b/.test(stderrLines[0]),
+      `no out-of-contract status may be claimed; got ${JSON.stringify(stderrLines[0])}`,
+    );
+    assertNoDisclosure(stderrLines[0], 'an internal-fault diagnostic');
   });
 
   test('a failure after headers are sent ends the response and says so', () => {
@@ -2828,11 +3037,16 @@ describe('server.js — a hostile host is rejected before it reaches a diagnosti
   /**
    * Attempt a bind with a chosen `HOST` and capture the process's output.
    *
+   * A reserved concrete port is supplied rather than `0`, because a resolved
+   * configuration port of `0` is rejected and would silently fall through to the
+   * tier's own 3000 — publishing a service the suite must not publish.
+   *
    * @param {string} host The `HOST` value to attempt.
+   * @param {number} port A port reserved by {@link reserveFreePort}.
    * @returns {{stdout: string, stderr: string, status: number|null}} Captured output.
    */
-  function attemptBind(host) {
-    const result = runNode([SERVER_PATH], { HOST: host, PORT: '0' });
+  function attemptBind(host, port) {
+    const result = runNode([SERVER_PATH], { HOST: host, PORT: String(port) });
     return {
       stdout: result.stdout.toString('utf8'),
       stderr: result.stderr.toString('utf8'),
@@ -2840,9 +3054,9 @@ describe('server.js — a hostile host is rejected before it reaches a diagnosti
     };
   }
 
-  test('a host carrying a newline cannot forge a start-up announcement', () => {
+  test('a host carrying a newline cannot forge a start-up announcement', async () => {
     const forgery = `${HANDLER_FAILURE_PREFIX}none\nhealth server listening on http://0.0.0.0:3000/health`;
-    const result = attemptBind(forgery);
+    const result = attemptBind(forgery, await reserveFreePort());
 
     assert.notStrictEqual(result.status, 0, 'an unbindable host must fail the start-up');
     assert.ok(
@@ -2860,8 +3074,8 @@ describe('server.js — a hostile host is rejected before it reaches a diagnosti
     );
   });
 
-  test('an unresolvable but well-formed host is reported with a stable category', () => {
-    const result = attemptBind('host.invalid.no-such-tld');
+  test('an unresolvable but well-formed host is reported with a stable category', async () => {
+    const result = attemptBind('host.invalid.no-such-tld', await reserveFreePort());
 
     assert.notStrictEqual(result.status, 0);
     // The host is legitimate-looking, so it is shown verbatim — that is the point
@@ -2882,14 +3096,14 @@ describe('server.js — a hostile host is rejected before it reaches a diagnosti
     );
   });
 
-  test('a legitimate loopback host binds and is rendered verbatim', () => {
+  test('a legitimate loopback host binds and is rendered verbatim', async () => {
     const result = runNode(
       [
         '-e',
         `const s = require(${JSON.stringify(SERVER_PATH)});` +
           'setTimeout(() => { process.kill(process.pid, "SIGTERM"); }, 250);',
       ],
-      { HOST: LOOPBACK, PORT: '0' },
+      { HOST: LOOPBACK, PORT: String(await reserveFreePort()) },
     );
 
     assert.strictEqual(result.stderr.length, 0, 'a valid configuration must produce no diagnostics');
@@ -3142,22 +3356,21 @@ describe('health.js — defensive request paths that a client cannot provoke', (
     );
   });
 
-  test('a response that fails once mid-write is completed by failing closed, never with a 404', () => {
+  test('a response whose status line cannot be written is closed, never answered 404', () => {
     // Simulates a socket that died between routing and writing. Nothing may escape
-    // the listener, and since no bytes reached the client a status can still be
-    // chosen — but it must not be the contract's `404`. A `404` is a statement about
-    // the client's request target, and the target here was `/health`, which exists:
+    // the listener, and no status may be invented: the contract enumerates exactly
+    // `200`, `405` and `404`, and a `404` in particular is a statement about the
+    // client's request target — the target here was `/health`, which exists, so
     // blaming the caller for a fault inside this process sends an investigation the
-    // wrong way. The non-normative `503` is the honest completion.
+    // wrong way. Closing the connection is the honest completion.
     const { res, recorded } = createResponseDouble({ failWriteHeadTimes: 1 });
 
     health.handleRequest({ method: 'GET', url: HEALTH_PATH }, res);
 
-    assert.strictEqual(recorded.writeHeadCalls, 2, 'the failed write must be retried exactly once');
-    assert.notStrictEqual(recorded.statusCode, 404, 'an internal fault is not a route miss');
-    assert.strictEqual(recorded.statusCode, STATUS_SERVICE_UNAVAILABLE);
-    assert.strictEqual(recorded.body.toString('utf8'), SERVICE_UNAVAILABLE_BODY);
-    assert.strictEqual(recorded.destroyed, false);
+    assert.strictEqual(recorded.writeHeadCalls, 1, 'the failed write must not be retried with a second status');
+    assert.strictEqual(recorded.statusCode, null, 'no status line reached the client');
+    assert.strictEqual(recorded.body, null, 'no body reached the client either');
+    assert.strictEqual(recorded.destroyed, true, 'the connection must be released');
   });
 
   test('a response that fails while writing the body is completed, not left hanging', () => {
@@ -3205,8 +3418,8 @@ describe('health.js — defensive request paths that a client cannot provoke', (
  * The documented precedence chain is environment variable, then configuration
  * file, then compiled-in literal. Group C.2 covers the first link; this group
  * covers the last, which is the one the contract insists on: the endpoint must
- * still serve a valid response when its configuration is absent from a container
- * image, because that is exactly the failure a health endpoint has to survive.
+ * still serve a valid response when its configuration cannot be read at all,
+ * because that is exactly the failure a health endpoint has to survive.
  *
  * Each case builds a private copy of the tier in a temporary directory under the
  * operating system's temporary root — never inside the working tree — where the
@@ -3264,11 +3477,7 @@ describe('health.js — configuration source failure falls back to the literals'
     assert.strictEqual(config.host, TIER_DEFAULT_HOST, `${label}: host falls back to the literal`);
     assert.strictEqual(config.port, TIER_DEFAULT_PORT, `${label}: port falls back to the literal`);
     assert.strictEqual(config.path, HEALTH_PATH, `${label}: path falls back to the literal`);
-    assert.strictEqual(
-      config.status,
-      undefined,
-      `${label}: status is a protocol constant, so it is never one of the resolved settings`,
-    );
+    assert.strictEqual(config.status, STATUS_LITERAL, `${label}: status falls back to the literal`);
   };
 
   test('with both sources absent, every value is the compiled-in literal', () => {
@@ -3348,15 +3557,19 @@ describe('health.js — configuration source failure falls back to the literals'
     assert.strictEqual(config.host, 'configured.example', 'a usable member is still honoured beside an unusable one');
   });
 
-  test('a configured path without a leading slash is normalized, never rejected', () => {
-    // A parsed pathname always begins with a slash, so a value written as `health`
-    // could never match anything without this normalization.
+  test('a configured path that is not the literal is rejected, not repaired', () => {
+    // `health` is a plausible typo for `/health`, and guessing at the intent would
+    // be the wrong repair: silently accepting a near-miss is how a tier ends up
+    // serving under a spelling the contract never defined. The declaration is
+    // refused, the literal is served, and the refusal is recorded.
     const workspace = isolate({
       'config/health.json': JSON.stringify({ path: 'health' }),
     });
-    const { config } = loadIsolatedTier(workspace);
+    const { config, sources, conflicts } = loadIsolatedTier(workspace);
 
     assert.strictEqual(config.path, HEALTH_PATH);
+    assert.strictEqual(sources.path, 'fallback');
+    assert.deepStrictEqual(conflicts, [{ key: 'path', configured: 'health', frozen: HEALTH_PATH }]);
   });
 
   test('a byte-order mark does not stop a source being read', () => {
@@ -3384,7 +3597,11 @@ describe('health.js — configuration source failure falls back to the literals'
     assert.strictEqual(config.host, LOOPBACK);
     assert.strictEqual(config.port, 3199);
     assert.strictEqual(config.name, TIER_NAME, 'identity has no environment override at any tier');
-    assert.strictEqual(config.status, undefined, 'status is not resolved, so no chain can reach it');
+    assert.strictEqual(
+      config.status,
+      STATUS_LITERAL,
+      'status has no environment layer, so an unusable file leaves the literal',
+    );
   });
 
   test('an unusable environment override falls through to the literal when no file remains', () => {
@@ -3416,20 +3633,22 @@ describe('health.js — configuration source failure falls back to the literals'
 
 /*
  * ---------------------------------------------------------------------------
- * Group H — `server.js`, the process the container and the pipeline run
+ * Group H — `server.js`, the long-lived entry point
  *
  * Group C.3 serves the contract from a handler this suite binds itself, which is
  * the right way to assert the contract but says nothing about the entry point.
  * `server.js` owns bind-target resolution, the single announced start-up line,
- * the signal handlers, the orderly shutdown and the start-up diagnostics — and it
- * is what `HEALTHCHECK` and CI actually execute. It calls `start()` at load and
- * exports nothing, so a child process is the only honest way to exercise it.
+ * the signal handlers, the orderly shutdown and the start-up diagnostics. It calls
+ * `start()` at load and exports nothing, so a child process is the only honest way
+ * to exercise it.
  *
- * Every child binds `PORT=0` on `HOST=127.0.0.1`: port 3000 belongs to the
- * pipeline's own server step, and a test must not publish a service. Every wait
- * is bounded, and every child is signalled and awaited — the `after` hook
- * escalates to `SIGKILL` — so a failing assertion can never leave a process
- * behind holding a port.
+ * Every child binds a port reserved by {@link reserveFreePort} on `HOST=127.0.0.1`:
+ * never the tier's own 3000, because a test must not publish a service on the port an
+ * operator expects to be the application, and never `PORT=0`, because a resolved
+ * configuration port of `0` is rejected — an endpoint on a port the operating system
+ * picked cannot be addressed by a fixed-number probe. Every wait is bounded, and
+ * every child is signalled and awaited — the `after` hook escalates to `SIGKILL` — so
+ * a failing assertion can never leave a process behind holding a port.
  * ---------------------------------------------------------------------------
  */
 
@@ -3452,13 +3671,15 @@ describe('server.js — the long-lived entry point', () => {
   };
 
   test('binds the requested host, announces the real port, and serves the contract there', async () => {
-    const managed = start({ HOST: LOOPBACK, PORT: String(EPHEMERAL_PORT) });
+    const requested = await reserveFreePort();
+    const managed = start({ HOST: LOOPBACK, PORT: String(requested) });
     const started = await managed.waitForStartup();
 
     assert.strictEqual(started.host, LOOPBACK, 'HOST must decide the interface that is bound');
-    assert.ok(
-      Number.isInteger(started.port) && started.port > 0,
-      'an ephemeral request must be announced as the port the operating system assigned',
+    assert.strictEqual(
+      started.port,
+      requested,
+      'the announced port must be the one PORT requested, read back from the bound listener',
     );
     assert.notStrictEqual(started.port, TIER_DEFAULT_PORT, 'the suite must never bind the tier port');
     assert.strictEqual(
@@ -3492,13 +3713,13 @@ describe('server.js — the long-lived entry point', () => {
   });
 
   test('SIGTERM closes the listener promptly, exits 0, and releases the port', async () => {
-    const managed = start({ HOST: LOOPBACK, PORT: String(EPHEMERAL_PORT) });
+    const managed = start({ HOST: LOOPBACK, PORT: String(await reserveFreePort()) });
     const started = await managed.waitForStartup();
 
     // A probe first, so a keep-alive socket is left behind on purpose: that idle
     // connection is what `closeIdleConnections` exists for, and without it the
     // close would wait out the keep-alive timeout and the port would linger —
-    // exactly the orphaned binding that breaks the next pipeline run.
+    // exactly the orphaned binding that makes the next start-up fail.
     const probe = await request(`http://${LOOPBACK}:${started.port}${HEALTH_PATH}`);
     assert.strictEqual(probe.status, 200);
     await probe.text();
@@ -3528,7 +3749,7 @@ describe('server.js — the long-lived entry point', () => {
   });
 
   test('SIGINT is handled identically — Ctrl-C is an orderly stop too', async () => {
-    const managed = start({ HOST: LOOPBACK, PORT: String(EPHEMERAL_PORT) });
+    const managed = start({ HOST: LOOPBACK, PORT: String(await reserveFreePort()) });
     const started = await managed.waitForStartup();
 
     managed.child.kill('SIGINT');
@@ -3541,7 +3762,7 @@ describe('server.js — the long-lived entry point', () => {
   });
 
   test('a repeated signal cannot start a second shutdown or a second log line', async () => {
-    const managed = start({ HOST: LOOPBACK, PORT: String(EPHEMERAL_PORT) });
+    const managed = start({ HOST: LOOPBACK, PORT: String(await reserveFreePort()) });
     await managed.waitForStartup();
 
     managed.child.kill('SIGTERM');
@@ -3554,8 +3775,8 @@ describe('server.js — the long-lived entry point', () => {
   });
 
   test('an occupied port fails fast with an actionable diagnostic and exit 1', async () => {
-    // A silent hang on a taken port is one of the worst pipeline failure modes
-    // there is: readiness polling times out and nothing in the log says why. The
+    // A silent hang on a taken port is among the worst start-up failure modes there
+    // is: readiness polling times out and nothing in the log says why. The
     // requirement is therefore both the non-zero status and the message.
     const occupied = await occupyEphemeralPort();
 
@@ -3614,7 +3835,7 @@ describe('server.js — the long-lived entry point', () => {
     // A typo in one source must degrade to the next source, never leave the listener
     // unbindable. The host is deliberately an address this machine does not own, so
     // the resolved port is observable in the diagnostic without ever binding port
-    // 3000 — which belongs to the pipeline's own server step, not to this suite.
+    // 3000 — the port an operator expects to be the real application.
     const managed = start({ HOST: '192.0.2.1', PORT: 'not-a-port' });
     const exit = await managed.waitForExit();
 
@@ -3644,7 +3865,7 @@ describe('server.js — the long-lived entry point', () => {
     // guaranteed not to be an address of any local interface: the bind fails with a
     // different errno than a taken port, and each errno has to produce its own
     // sentence naming the defect and the remedy.
-    const managed = start({ HOST: '192.0.2.1', PORT: String(EPHEMERAL_PORT) });
+    const managed = start({ HOST: '192.0.2.1', PORT: String(await reserveFreePort()) });
     const exit = await managed.waitForExit();
 
     assert.strictEqual(exit.code, 1);

@@ -3,16 +3,12 @@
 /**
  * Long-lived `/health` server entry point — Level 1 (apex) tier.
  *
- * This is a *second, parallel* entry point rather than a change to `index.js`, and
- * that separation is the single most important architectural fact about this file.
- * Every emission in `index.js` happens during script initialization, with no event
- * loop work and no deferred callback, so that process is one-shot and terminates
- * immediately. A listener makes a process long-lived, so putting `listen()` into
- * `index.js` would make `node index.js` hang forever and destroy the preservation
- * invariant: `node index.js` must still exit `0` after writing exactly five lines
- * and fifteen bytes to standard output, with the md5 of that output still
- * `b07373a80ad21069e41be538e6506d00`. The health server is therefore started only
- * by `node server.js`, and `index.js` is neither required nor modified from here.
+ * A *second, parallel* entry point rather than a change to `index.js`. `listen()`
+ * must not reach `index.js`: it would make that process long-lived and destroy its
+ * invariant, which is that `node index.js` still exits `0` after writing exactly
+ * five lines and fifteen bytes to standard output, md5
+ * `b07373a80ad21069e41be538e6506d00`. `index.js` is therefore neither required nor
+ * modified from here.
  *
  * Division of responsibility with `health.js`, which this file never duplicates:
  * `health.js` owns the payload, the serialization, the contract headers, the status
@@ -22,22 +18,20 @@
  * start-up failure, and shutting the listener down in an orderly fashion on a
  * signal.
  *
- * Bind-target resolution uses the precedence chain that is uniform across all
- * three tiers:
+ * Bind-target resolution reapplies the tier's chain at bind time:
  *
  *     environment variable  ->  configuration file  ->  compiled-in literal
  *          HOST / PORT            config/health.json        0.0.0.0 / 3000
  *
- * This tier's override names are exactly `HOST` and `PORT`. Levels 2 and 3
- * deliberately use the prefixed `HEALTH_HOST` and `HEALTH_PORT` names instead
- * because each of those tiers owns a broader process environment; that asymmetry
- * is intentional and must not be "harmonized". The middle link is read once by
- * `health.js` and consumed here through its resolved `config` export, so
- * `config/health.json` is parsed in exactly one place in the tier and the two
- * cannot drift apart. The literals below are the last link, and they are required
- * rather than decorative: they guarantee the listener still binds and still serves
- * a valid contract when the configuration file is missing, which is precisely the
- * failure a health endpoint has to survive.
+ * This tier's override names are exactly `HOST` and `PORT`; Levels 2 and 3
+ * deliberately use the prefixed `HEALTH_HOST` and `HEALTH_PORT` names instead,
+ * and that asymmetry is intentional and must not be "harmonized". The middle link
+ * is parsed once, by `health.js`, and consumed here through its resolved `config`
+ * export, so `config/health.json` is read in exactly one place in the tier and the
+ * two cannot drift apart. The literals below are the last link, and they are
+ * required rather than decorative: they guarantee the listener still binds and
+ * still serves a valid contract when the configuration file is missing, which is
+ * precisely the failure a health endpoint has to survive.
  *
  * A single listener is the whole requirement, so there is deliberately no
  * clustering, worker thread, child process, daemonization, PID file, restart loop,
@@ -78,9 +72,13 @@ const FALLBACK = Object.freeze({
   path: '/health',
 });
 
-// `0` asks the operating system for an ephemeral port. A bare decimal integer is
-// the only port form accepted from a string source.
-const MIN_PORT = 0;
+// The usable range for a configured port, identical to `health.js`'s and to the
+// sibling tiers'. `0` is excluded on purpose: it asks the operating system to
+// choose a port at random, so the listener would bind an address no probe,
+// `HEALTHCHECK` instruction or workflow assertion could predict — running and
+// unreachable at once. A bare decimal integer is the only port form accepted from
+// a string source.
+const MIN_PORT = 1;
 const MAX_PORT = 65535;
 const DECIMAL_INTEGER = /^[0-9]+$/;
 
@@ -185,10 +183,11 @@ function resolveBindTarget() {
  * directly actionable. Routing itself is entirely `health.js`'s concern and is
  * never re-derived here.
  *
- * `health.js` guarantees this value is the frozen contract path — configuration
- * cannot redefine it — so this is a read rather than a resolution. The guards
- * exist only so that a hand-built `config` double in a test cannot make the log
- * line throw.
+ * `health.js` resolves this value from `config/health.json` and validates it
+ * against the contract before adopting it, so it is guaranteed to be the frozen
+ * contract path whatever the file says. Reading it here is therefore a read rather
+ * than a second resolution. The guards exist only so that a hand-built `config`
+ * double in a test cannot make the log line throw.
  *
  * @returns {string} The resource path, always beginning with `/`.
  */
@@ -488,11 +487,11 @@ function shutdown(server, signal) {
  * requirement: an endpoint that refuses to answer because of its own configuration
  * turns a running application into one that reports itself unhealthy. But
  * resilience without a report is indistinguishable from correctness. The failure
- * mode this closes is a real and quiet one — an image built without
- * `config/health.json`, or with the file excluded by an over-broad
- * `.dockerignore` pattern, serves a perfectly valid `200` carrying fallback
- * identity, its container health check goes green, and CI passes. Every signal
- * says healthy while the payload no longer describes the build it came from.
+ * mode this closes is a real and quiet one — a deployment assembled without
+ * `config/health.json`, or with the file excluded by an over-broad ignore
+ * pattern, serves a perfectly valid `200` carrying fallback identity, so any
+ * automated check that only looks at the response would pass. Every signal would
+ * say healthy while the payload no longer describes the build it came from.
  *
  * Reporting happens here rather than in `health.js` for one hard reason: requiring
  * `health.js` must stay byte-silent on both streams, because the unit suite loads
@@ -575,12 +574,15 @@ function sanitizeConfiguredValue(value) {
  * Report, once at start-up, any configured value that was rejected for trying to
  * redefine a frozen contract value.
  *
- * The resource path and the `status` literal are contract constants, so
- * `health.js` serves them whatever a configuration document says. Serving the
- * right thing is not by itself enough, though: a deployment that edited
- * `config/health.json` expecting an effect would otherwise get silence, and would
- * discover the truth only from a monitoring gap. One warning line per rejected
- * value names the key, what was configured and what is served instead.
+ * The resource path and the `status` literal are resolved from
+ * `config/health.json` like every other setting, but their declarations are
+ * validated against the contract first: only the contract's own literal is
+ * adopted, and anything else is refused so that `health.js` serves the frozen
+ * value whatever the document says. Serving the right thing is not by itself
+ * enough, though: a deployment that edited `config/health.json` expecting an
+ * effect would otherwise get silence, and would discover the truth only from a
+ * monitoring gap. One warning line per rejected value names the key, what was
+ * configured and what is served instead.
  *
  * Written to standard error because it reports a misconfiguration rather than
  * normal progress, and emitted here rather than inside `health.js` because that
