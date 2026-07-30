@@ -1,63 +1,52 @@
 # Build-context denylist for the apex (Level 1) JavaScript tier.
 #
 # The sibling Dockerfile copies its runtime files BY NAME, so this file does not
-# decide what lands in the image -- it decides what the daemon has to receive
-# before the build starts. Excluding .git alone is the difference between a
-# context measured in megabytes and one measured in kilobytes.
+# decide what lands in the image — it decides what the daemon has to receive before
+# the build starts. Kept an explicit denylist rather than a `*` with `!`
+# re-inclusions, where one mis-ordered negation drops a file silently.
 #
-# Keep this an explicit denylist. A catch-all "*" with "!" re-inclusions is
-# harder to reason about, and one mis-ordered negation drops a file silently.
-# An unanchored pattern matches at the context root only, which is enough here:
-# every source file sits at the root and every excluded subtree is excluded as a
-# whole directory.
-#
-# Never exclude package.json or config/health.json. health.js reads both at
-# module load and falls back to compiled-in literals rather than failing, so
-# their absence would leave the endpoint answering 200 with an identity this
-# repository never declared -- a failure with no symptom. So no broad *.json,
-# config or config/* pattern. ("*.test.js" below is safe: none of index.js,
-# health.js or server.js ends in ".test.js".)
+# Never exclude package.json or config/health.json: health.js falls back to
+# compiled-in literals rather than failing, so their absence would leave the
+# endpoint answering 200 with an identity this repository never declared — a failure
+# with no symptom. So no broad *.json, config or config/* pattern. (`*.test.js` is
+# safe: none of index.js, health.js or server.js ends in `.test.js`.)
 
-# Version-control metadata, its rules file and its submodule declaration. .git
-# also carries local remote-tracking configuration that must not enter a layer.
+# Version-control metadata. .git also carries local remote-tracking configuration
+# that must not enter a layer.
 .git
 .gitignore
 .gitmodules
 
-# The child submodule's working tree. Each tier builds its own image from its
-# own sources, so a Node image has no use for Python and Java trees. This is a
-# build-context exclusion only; the submodule stays fully tracked in Git.
+# The child submodule's working tree: each tier builds its own image from its own
+# sources. A build-context exclusion only — the submodule stays tracked in Git.
 child_repo_10_LOC
 
-# Build-time-only container definitions: read from the context before the build,
-# useless inside a running container.
+# Build-time-only inputs, read from the context before the build.
 .dockerignore
 Dockerfile
 
-# A .github directory, whenever one is added. Anything under it is read from the
-# repository rather than from inside an image, so it never belongs in a context.
+# A .github directory, whenever one is added: read from the repository, never from
+# inside an image.
 .github
 
-# Local environment files. A secrets file must never enter an image layer, and
-# nothing here parses one anyway: this tier reads process.env directly. The
-# pattern also covers the tracked .env.example, which is documentation.
+# Local environment files, including the tracked .env.example template. Nothing here
+# parses one — this tier reads process.env directly.
 .env*
 
-# Installed dependency tree. This tier has none -- every module it loads is a
-# Node built-in -- so this line exists to keep a stale host directory out of the
-# context, not to protect the image: the Dockerfile copies named files only, so
-# node_modules could not reach /app in any case.
+# This tier installs nothing, so this keeps a stale host directory out of the
+# context; it is not what protects the image, since the Dockerfile copies named
+# files only.
 node_modules
 
 # Test sources. A runtime image ships no test.
 *.test.js
 
-# Documentation, including the normative contract document. health.js and
-# server.js reference docs/health-endpoint.md in comments and never open it.
+# Documentation, including the normative contract document, which health.js and
+# server.js reference in comments and never open.
 docs
 README.md
 
-# Execution residue from a local test or npm run. Not reproducible input.
+# Execution residue from a local run. Not reproducible input.
 coverage
 .npm
 npm-debug.log*
@@ -67,8 +56,6 @@ npm-debug.log*
 .DS_Store
 Thumbs.db
 
-# Deliberately NOT excluded: .nvmrc. It pins the Node version for contributors
-# and is unused at run time -- the image's Node comes from the base tag -- but it
-# is eight bytes and keeps /app consistent with the repository. Python and Java
-# residue patterns are absent because this tier cannot produce them; Levels 2
-# and 3 exclude their own.
+# Deliberately NOT excluded: .nvmrc, which keeps /app consistent with the
+# repository. Python and Java residue patterns are absent because this tier cannot
+# produce them; Levels 2 and 3 exclude their own.

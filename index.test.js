@@ -9,76 +9,32 @@
  * into a `tests/` directory or switching to `.spec.js` would silently remove it
  * from the default run.
  *
- * Eight groups, each here for a reason the code alone does not show:
+ * Eight groups. Each group's own comment states what it asserts and why; this index
+ * exists so the shape of the suite is visible from the top:
  *
- *   A. **Export surface.** `add` returns `12` for `(5, 7)` *and* is reachable as an
- *      export, which is what locks in the export surface rather than merely
- *      restating arithmetic.
- *   B. **Non-regression, measured rather than intended.** Importing `index.js` must
- *      write nothing, and running it directly must still emit exactly five lines
- *      and fifteen bytes whose md5 is `b07373a80ad21069e41be538e6506d00`. Both are
- *      checked in a real child process, because `require`'s module cache makes any
- *      in-process check of load-time output unreliable, and monkey-patching
- *      `console.log` would test the patch rather than the program.
- *   C. **The frozen `/health` contract**, first against the payload builder in
- *      isolation and then over a real TCP socket: status line, both contract
- *      headers, exactly four body members in a fixed order, the literal `UP`, an
- *      RFC 3339 UTC timestamp that is provably fresh, compact serialization, and
- *      the two negative paths — `405` with `Allow: GET, HEAD`, and `404` — with the
- *      method checked before the path, so `POST /unknown` is a `405`.
- *   D. **The two values configuration may declare but not redefine.** The resource
- *      path and the `status` literal are read from the serving document like every
- *      other setting, but validated against the contract before they are adopted:
- *      a declaration that restates the literal is taken from the file, and anything
- *      else is refused in favour of the literal and recorded as a conflict. This
- *      group loads `health.js` in a child process behind an injected loader that
- *      returns a hostile serving document, and proves the endpoint still routes on
- *      `/health` and still reports `UP` — while asserting that the two freely
- *      configurable values in that same document, host and port, *did* change, so
- *      the group cannot pass vacuously. The exported provenance is asserted
- *      alongside every value, so an adoption and a refusal are told apart rather
- *      than inferred from a value that happens to look right, and a second
- *      sub-group asserts both directions for `status`: a legal declaration is
- *      adopted from the file, an illegal one falls back and is reported.
- *   E. **One resource, one spelling**, asserted against the routing decision
- *      directly and then again with request lines written to a socket by hand.
- *      `/health` is the only spelling of the resource: a percent-encoded,
- *      repeated-slash, dot-segment, fragment, absolute-form or protocol-relative
- *      variant of it must answer `404`. A general-purpose URL parser folds several
- *      of those onto `/health`, so proving the rule requires transmitting the
- *      target verbatim, which no HTTP client will do.
- *   F. **Configuration resilience, and a fallback that is never silent.** The
- *      documented precedence chain ends in a compiled-in literal, and that last
- *      link is a contract requirement rather than a nicety: the endpoint must still
- *      serve when its configuration cannot be read at all. So a copy of `health.js`
- *      is loaded from a private temporary directory whose identity and serving
- *      sources are missing, malformed, not JSON objects, or carry values of the
- *      wrong type; every resolved value is asserted to be the documented literal;
- *      the recorded reason for each substitution is asserted alongside it; and that
- *      reason is asserted once more as the single line `server.js` writes at
- *      start-up.
- *   G. **Diagnostics that can be neither misattributed nor forged.** An unexpected
- *      handler failure must be reported as what it is rather than rendered as a
- *      misleading `404`, an expected transport error — a peer that hung up — must
- *      not be reported at all, and a configuration-derived host carrying a newline
- *      must never be able to write a second log line that reads like this server's
- *      own start-up announcement.
- *   H. **The process entry point.** `server.js` calls `start()` at load and exports
- *      nothing, so a real child process is the only honest way to exercise it:
- *      bind-target resolution, the single announced start-up line, the contract
- *      served over the announced port, prompt `SIGTERM`/`SIGINT` shutdown with exit
- *      `0` and a released port, and an actionable diagnostic with exit `1` when the
- *      port is already taken.
+ *   A. Export surface — `add` is reachable *as an export*, not merely correct.
+ *   B. Non-regression of the pre-existing program, in a real child process.
+ *   C. The frozen `/health` contract, in isolation and then over a real socket.
+ *   D. The two values configuration may declare but not redefine (path, status),
+ *      loaded behind an injected hostile serving document.
+ *   E. One resource, one spelling — request lines written to a socket by hand.
+ *   F. Configuration resilience, with a fallback that is never silent.
+ *   G. Diagnostics that can be neither misattributed nor forged.
+ *   H. The process entry point, exercised as a real child process.
  *
- * Freshness is asserted between **immediately consecutive** calls and responses,
- * with no delay inserted anywhere. That is deliberate: inserting a wait past a
- * millisecond boundary first would reduce the assertion to "the clock moved", which
- * a builder returning duplicates to two probes landing in the same millisecond
- * would still satisfy. The burst assertions go further and draw many samples inside
- * a single millisecond tick, where uniqueness and strict ordering can only hold if
- * the timestamp is allocated monotonically rather than read raw. A companion
- * assertion bounds how far that allocation may sit ahead of real time, so the
- * correction is proven finite and self-correcting rather than a licence to drift.
+ * Two methodological choices that are not visible from the assertions themselves:
+ *
+ *   - **Group B runs in a child process** because `require`'s module cache makes any
+ *     in-process check of load-time output unreliable, and monkey-patching
+ *     `console.log` would test the patch rather than the program.
+ *   - **Freshness is asserted between immediately consecutive calls**, with no delay
+ *     inserted anywhere. A wait past a millisecond boundary would reduce the
+ *     assertion to "the clock moved", which a builder handing duplicates to two
+ *     probes in the same millisecond would still satisfy. The burst assertions draw
+ *     many samples inside one millisecond tick, where uniqueness and strict ordering
+ *     can hold only if the timestamp is allocated monotonically rather than read raw,
+ *     and a companion assertion bounds how far that allocation may sit ahead of real
+ *     time so the correction is finite rather than a licence to drift.
  *
  * The contract asserted here is defined normatively in `docs/health-endpoint.md`
  * and implemented in `health.js`. That document is documentation only — it is
@@ -3738,11 +3694,9 @@ describe('health.js — defensive request paths that a client cannot provoke', (
   test('the health response is emitted as one logical write, not a head then a body', () => {
     // The deterministic half of the contract's single-write clause
     // (`docs/health-endpoint.md` §9.5), and the reason the keep-alive test on the wire
-    // does not need to count TCP segments. The defect this rules out was measured at
-    // the sibling Python tier: the head went out in one write and the body in a
-    // second, and on an unbuffered socket with Nagle's algorithm enabled the second
-    // write waited on the peer's delayed acknowledgement — ~41 ms per keep-alive
-    // request instead of ~0.1 ms, with nothing wrong in the response itself.
+    // does not need to count TCP segments. The defect it rules out is a head written
+    // separately from its body, which leaves the second write waiting on the peer's
+    // delayed acknowledgement while the response itself looks perfectly correct.
     //
     // Asserted at the handler, where it is a fact about the code rather than a
     // measurement of the transport: exactly one `writeHead`, exactly one `end`, the

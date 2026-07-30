@@ -3,78 +3,55 @@
 /**
  * `/health` payload builder and HTTP request handler for `parent_repo_10_LOC`.
  *
- * `docs/health-endpoint.md` defines the contract normatively, and it is
- * documentation only: it is never imported, read, parsed or validated against at
- * run time. The sibling Python and Java applications implement the same contract
- * independently, sharing a *documented* contract and no runtime artifact, which is
- * what keeps the levels runtime-independent. Nothing here references a path
- * outside this tier.
+ * `docs/health-endpoint.md` is the normative contract and is **documentation
+ * only** — never imported, read or validated against at run time. The sibling
+ * Python and Java applications implement the same contract independently, sharing
+ * the document and no runtime artifact, which is what keeps the levels
+ * runtime-independent; nothing here references a path outside this tier. Read that
+ * document for the response vocabulary rather than a restatement of it here.
  *
- * The contract's three responses, which are the whole of its vocabulary:
+ * Decisions that are not obvious from the code below:
  *
- *   - `200` with the four-member body `{name, version, timestamp, status}` in that
- *     order, compactly serialized, `Content-Type: application/json; charset=utf-8`
- *     and `Cache-Control: no-store`.
- *   - `405` + `Allow: GET, HEAD` + `{"error":"Method Not Allowed"}` for any other
- *     method, whatever the path.
- *   - `404` + `{"error":"Not Found"}` for a `GET` or `HEAD` of any other path.
- *
- * Routing is METHOD FIRST, then path, which is why `POST /unknown` answers `405`
- * rather than `404`: a caller learns the most actionable fact first. **No routed
- * request can produce a 5xx**, and no code path in this module writes one — the
- * handler reads one already-resolved value set and one clock, so it has no
- * expected failure. An unexpected internal fault is reported server-side and the
- * connection is closed without inventing a status; see
- * {@link finalizeAfterUnexpectedError}.
- *
- * A canonical success body, byte for byte:
- *
- *   {"name":"parent_repo_10_LOC","version":"1.0.0","timestamp":"2026-07-28T13:35:56.452Z","status":"UP"}
- *
- * Three contract choices look arbitrary and are not. `status: "UP"` and the
- * presence of `version` follow the IETF Internet-Draft *Health Check Response
- * Format for HTTP APIs* (draft-inadarei-api-health-check-06), which also makes
- * `200` mandatory for a healthy status rather than merely conventional. The
- * content type is `application/json` rather than that draft's
- * `application/health+json`, so ordinary tooling parses the payload with no
- * special handling. The date-time member is named `timestamp` rather than the
- * draft's `time` because the draft scopes `time` to when an observed value was
- * *recorded*, while this carries the *current* time.
- *
- * Five constraints, each for a concrete reason:
- *
- *   - **CommonJS only**, never `import` / `export`. The sibling `package.json`
- *     omits the ES-module `type` field so the whole tier resolves as CommonJS,
- *     which is what makes the `require.main === module` guard in `index.js` work.
- *   - **Standard library only** — `node:http`, `node:fs`, `node:path` — so the
- *     third-party runtime dependency count stays at zero.
- *   - **Importable with no side effects.** Requiring this module reads two
- *     configuration files and returns; it binds no socket, writes nothing to
- *     either stream and schedules no timer, so the unit suite can assert the
- *     payload without opening a port. All binding lives in `server.js`.
- *   - **Configuration once, clock per request.** Identity and serving values are
- *     resolved a single time at module load; only the clock is read inside the
- *     handler. That keeps the probe lightweight (no per-request I/O) while still
- *     making every response provably fresh.
- *   - **Every served value is resolved from a declared source, and configuration
- *     still cannot redefine the contract.** Nothing is hard-coded at its point of
- *     use: the identity pair resolves from `package.json`, and the bind target,
- *     the resource path and the status all resolve from `config/health.json`
- *     through {@link loadConfig}. For the two the contract freezes —
- *     the path and the status — resolution is *validated*: a declared value is
- *     adopted only when it is exactly the contract's own literal, and any other
- *     value is rejected, recorded in {@link frozenValueConflicts} and reported at
- *     start-up while the frozen literal continues to be served. A settable path
- *     would move the endpoint a probe polls, and a settable status would let a
- *     deployment lie about its own health; both would corrupt the contract while
- *     leaving the response syntactically valid, which is the hardest kind of
- *     failure to notice. {@link configSources} records which link of each chain
- *     supplied each value, so the source-to-runtime mapping is assertable.
- *   - **Exactly one accepted request target.** The path comparison is made against
- *     the request target's raw origin-form path, with only the query component
- *     removed. Nothing is percent-decoded, no dot segment is collapsed and no
- *     absolute-form target is accepted, so `/health` is the one and only spelling
- *     that answers `200`.
+ *   - **Routing is method first, then path**, so `POST /unknown` answers `405`
+ *     rather than `404`: a caller learns the most actionable fact first.
+ *   - **No routed request can produce a 5xx**, and no code path here writes one —
+ *     the handler reads one already-resolved value set and one clock, so it has no
+ *     expected failure. An unexpected internal fault is reported server-side and
+ *     the connection closed without inventing a status; see
+ *     {@link finalizeAfterUnexpectedError}.
+ *   - **`status: "UP"`, `version` and the mandatory `200`** follow the IETF
+ *     Internet-Draft *Health Check Response Format for HTTP APIs*
+ *     (draft-inadarei-api-health-check-06). Two deliberate departures from it:
+ *     `application/json` instead of `application/health+json`, so ordinary tooling
+ *     needs no special handling; and `timestamp` instead of `time`, because the
+ *     draft scopes `time` to when an observed value was *recorded* while this
+ *     carries the *current* time.
+ *   - **CommonJS only**, never `import` / `export` — the sibling `package.json`
+ *     omits the ES-module `type` field so the tier resolves as CommonJS, which is
+ *     what makes the `require.main === module` guard in `index.js` work.
+ *   - **Standard library only** (`node:http`, `node:fs`, `node:path`), keeping the
+ *     third-party runtime dependency count at zero.
+ *   - **Importable with no side effects**: requiring this module reads two
+ *     configuration files and returns, binding no socket, writing to neither
+ *     stream and scheduling no timer, so the unit suite can assert the payload
+ *     without opening a port. All binding lives in `server.js`.
+ *   - **Configuration once, clock per request**, which keeps the probe free of
+ *     per-request I/O while still making every response provably fresh.
+ *   - **Every served value resolves from a declared source, yet configuration
+ *     cannot redefine the contract.** The identity pair resolves from
+ *     `package.json` and the bind target, resource path and status from
+ *     `config/health.json` via {@link loadConfig}. For the two values the contract
+ *     freezes — path and status — a declared value is adopted only when it equals
+ *     the contract literal; anything else is rejected, recorded in
+ *     {@link frozenValueConflicts} and reported at start-up while the literal keeps
+ *     being served. A settable path would move the endpoint a probe polls and a
+ *     settable status would let a deployment lie about its own health, each
+ *     corrupting the contract while leaving the response syntactically valid.
+ *     {@link configSources} records which link of each chain supplied each value.
+ *   - **Exactly one accepted request target.** The path is compared against the
+ *     request target's raw origin-form path with only the query removed — nothing
+ *     percent-decoded, no dot segment collapsed, no absolute-form target accepted —
+ *     so `/health` is the one spelling that answers `200`.
  *
  * @module health
  */
@@ -86,19 +63,14 @@ const path = require('node:path');
 /**
  * The one resource path this tier serves — the contract's frozen value for it.
  *
- * The contract admits exactly one route, all three tiers serve the same one, and
- * every probe written against this endpoint addresses this literal. It is
- * therefore a *validated* setting rather than a free one: {@link loadConfig}
- * resolves `path` from `config/health.json`, but adopts the declared value only
- * when it is exactly this literal. Any other declaration is rejected by
- * {@link resolveFrozenValue}, recorded by {@link findFrozenValueConflicts} and
- * reported at start-up, rather than silently moving the endpoint away from where
- * monitoring looks for it. When the declaration is absent this literal is the
- * fallback, so a missing file degrades to identical behaviour.
- *
- * The status literal is validated in exactly the same way and for the same
- * reasons, and is declared with the other contract constants as
- * {@link STATUS_UP}.
+ * A *validated* setting rather than a free one: {@link loadConfig} resolves `path`
+ * from `config/health.json` but adopts the declaration only when it equals this
+ * literal, because every probe written against this endpoint addresses this literal
+ * and a settable path would move the endpoint away from where monitoring looks.
+ * Any other declaration is rejected by {@link resolveFrozenValue}, recorded by
+ * {@link findFrozenValueConflicts} and reported at start-up; an absent declaration
+ * falls back here, so a missing file degrades to identical behaviour.
+ * {@link STATUS_UP} is validated the same way for the same reasons.
  *
  * @type {string}
  */
@@ -108,22 +80,18 @@ const FROZEN_PATH = '/health';
  * The one healthy status value the contract permits, and the contract's frozen
  * value for the `status` member.
  *
- * A wire-protocol constant that a deployment may restate but never choose. It is
- * resolved by {@link loadConfig} from `config/health.json` exactly as `path` is,
- * and validated exactly as strictly: a declaration equal to this literal is
- * adopted, and any other declaration is rejected, recorded and reported. That
- * strictness is a safety property rather than a simplification. A freely settable
- * `status` would let a deployment, or a stray edit to a container image, publish
- * `"status":"DOWN"` — or any other string — from a process that is running
- * perfectly well, and would let two tiers of this composition disagree about the
- * one value every consumer branches on. This endpoint reports process liveness and
- * performs no dependency checks, so the word on the wire has to mean "this process
- * answered", and it can only mean that if nothing outside the contract is able to
+ * A wire-protocol constant that a deployment may restate but never choose, resolved
+ * and validated exactly as `path` is. The strictness is a safety property: a freely
+ * settable `status` would let a deployment — or a stray edit to a container image —
+ * publish `"status":"DOWN"` from a process running perfectly well, and would let two
+ * tiers disagree about the one value every consumer branches on. This endpoint
+ * reports process liveness and performs no dependency checks, so the word on the
+ * wire can only mean "this process answered" if nothing outside the contract may
  * choose it. A live process is `UP` by definition.
  *
- * A rejection is never silent, and never refuses to serve: the endpoint keeps
- * answering with this literal and `server.js` names the rejected value once at
- * start-up — see {@link findFrozenValueConflicts}.
+ * A rejection is never silent and never refuses to serve: this literal keeps being
+ * answered and `server.js` names the rejected value once at start-up — see
+ * {@link findFrozenValueConflicts}.
  *
  * @type {string}
  */
@@ -133,14 +101,12 @@ const STATUS_UP = 'UP';
  * Compiled-in literals for every payload and serving value — the last link of
  * every resolution chain.
  *
- * Required rather than decorative: they guarantee that the endpoint still serves
- * a valid, complete contract when a configuration file is absent from a container
- * image, which is precisely the failure mode a health endpoint has to survive. An
- * endpoint that cannot answer because its own configuration is missing is worse
- * than no endpoint at all, because it turns a running application into one that
- * reports itself unhealthy. When a fallback is used because a source was missing
- * or malformed, the reason is recorded in {@link configDegradations} rather than
- * discarded, so the substitution is observable instead of silent.
+ * Required rather than decorative: they guarantee a valid, complete contract when a
+ * configuration file is absent from a container image, which is precisely the
+ * failure mode a health endpoint has to survive — an endpoint that cannot answer
+ * because its own configuration is missing turns a running application into one that
+ * reports itself unhealthy. Each substitution's reason is recorded in
+ * {@link configDegradations} rather than discarded, so it is observable.
  *
  * `path` and `status` are single-sourced here from {@link FROZEN_PATH} and
  * {@link STATUS_UP}, so the fallbacks can never drift from the contract values
@@ -164,17 +130,14 @@ const DEFAULTS = Object.freeze({
  * the server is started from arbitrary directories, and a CWD-relative read would
  * resolve differently in each.
  *
- * One measured runtime property matters for the degradation reasons below. Node's
- * CommonJS loader reads the nearest parent `package.json` itself, to decide
- * whether a `.js` file is CommonJS or an ES module. Verified on Node 24.18.0: a
- * *malformed* `package.json` therefore makes `require()` of **any** `.js` file in
- * this directory fail with `ERR_INVALID_PACKAGE_CONFIG` before a single line of
- * this module evaluates, while an *absent* `package.json` loads perfectly. So
- * `identity: declared source malformed` is not reachable at this tier — the
- * process cannot get far enough to report it — and a maintainer trying to
- * reproduce that case will be looking at a loader failure, not at a health
- * diagnostic. `missing`, `unreadable` and `incomplete` are all reachable and are
- * all exercised by the unit suite.
+ * One runtime property bounds the degradation reasons below. Node's CommonJS loader
+ * reads the nearest parent `package.json` itself to decide whether a `.js` file is
+ * CommonJS or an ES module, so a *malformed* `package.json` makes `require()` of
+ * **any** `.js` file here fail with `ERR_INVALID_PACKAGE_CONFIG` before this module
+ * evaluates, while an *absent* one loads perfectly. `identity: declared source
+ * malformed` is therefore unreachable at this tier — a maintainer reproducing that
+ * case is looking at a loader failure, not a health diagnostic. `missing`,
+ * `unreadable` and `incomplete` are reachable and are all exercised by the suite.
  *
  * @type {string}
  */
@@ -414,22 +377,17 @@ function classifyLoadFailure(error) {
  * in one place — the resolution chain — instead of spreading `try`/`catch`
  * through configuration handling.
  *
- * What this function deliberately does *not* do is discard the reason. An earlier
- * revision returned a bare `null`, which made a missing file, an unreadable file
- * and a malformed file indistinguishable to the caller and therefore to the
- * operator: the endpoint answered `200` with fallback identity and nothing
- * anywhere said the declared source had been ignored. The reason travels back
- * with the document so `loadConfig` can record it.
+ * The reason is deliberately **not** discarded. A bare `null` would make missing,
+ * unreadable and malformed indistinguishable to the caller and so to the operator:
+ * the endpoint would answer `200` with fallback identity and nothing would say the
+ * declared source had been ignored.
  *
- * Reporting is the caller's job, not this function's. Requiring this module must
- * stay byte-silent on both streams — the unit suite asserts exactly that — so
- * nothing here writes anywhere. `server.js` renders the recorded reasons once at
- * start-up, where a process that is about to serve traffic can legitimately say
- * something.
+ * Reporting is the caller's job. Requiring this module must stay byte-silent on both
+ * streams — the suite asserts exactly that — so nothing here writes anywhere;
+ * `server.js` renders the recorded reasons once at start-up.
  *
- * Arrays and `null` are rejected along with parse failures, because a caller
- * reading named members from either would silently observe `undefined` and
- * accept it as "configured".
+ * Arrays and `null` are rejected along with parse failures, because a caller reading
+ * named members from either would observe `undefined` and accept it as "configured".
  *
  * @param {string} filePath Absolute path to a UTF-8 encoded JSON document.
  * @returns {{document: Object<string, unknown>|null, reason: string|null}} The
@@ -636,39 +594,28 @@ const SERVING_LOAD = readJsonFile(SERVING_CONFIG_PATH);
  * Precedence is **not** uniform across the five resolved values, and describing it
  * as if it were would misdocument the code. There are three distinct chains:
  *
- *   - `name`, `version` — `package.json`, then the compiled-in literal. No
- *     environment override: identity is a declared fact of the build that tells
- *     an operator which artifact is live, so a value retyped at launch would
- *     defeat the only reason the field exists.
- *   - `host`, `port` — `HOST` / `PORT`, then `config/health.json`, then the
- *     literal. These are the two overrides this tier declares, because a
- *     container or a CI job legitimately relocates the listener without editing a
- *     tracked file. Levels 2 and 3 deliberately use the prefixed `HEALTH_HOST` and
- *     `HEALTH_PORT` names instead; that asymmetry is intentional and must not be
+ *   - `name`, `version` — `package.json`, then the literal. No environment override:
+ *     identity is a declared fact of the build telling an operator which artifact is
+ *     live, so a value retyped at launch defeats the only reason the field exists.
+ *   - `host`, `port` — `HOST` / `PORT`, then `config/health.json`, then the literal,
+ *     because a container legitimately relocates the listener without editing a
+ *     tracked file. Levels 2 and 3 deliberately use the prefixed `HEALTH_HOST` /
+ *     `HEALTH_PORT` names; that asymmetry is intentional and must not be
  *     "harmonized".
- *   - `path`, `status` — `config/health.json`, then the literal, with the
- *     declaration *validated* against the contract before it is adopted (see
- *     {@link resolveFrozenValue}). No environment override, because moving the
- *     resource path or the reported status per process would break the contract
- *     every consumer probes; and no free choice from the file either, because the
- *     contract admits exactly one legal value for each.
+ *   - `path`, `status` — `config/health.json`, then the literal, with the declaration
+ *     *validated* first (see {@link resolveFrozenValue}). No environment override and
+ *     no free choice from the file, because the contract admits exactly one legal
+ *     value for each and moving either would break what every consumer probes.
  *
- * Every source is read at module scope and nowhere else, so the whole file has a
- * single place where resolution happens and no value is hard-coded at its point
- * of use — including the two the contract freezes, which are read from the
- * declared source like everything else and merely validated more strictly.
+ * Every source is read at module scope and nowhere else, so resolution happens in one
+ * place and no value is hard-coded at its point of use.
  *
- * The second return member records **where each value came from**, so the chain is
- * assertable rather than assumed: see {@link FROM_ENVIRONMENT}. It is the only way
- * to distinguish an adopted declaration from an absent or rejected one for `path`
- * and `status`, whose legal declaration is by definition equal to the fallback.
- *
- * Degradation recording is the third part of the job. When a declared source
- * cannot supply its values, the endpoint still answers — that is the whole point
- * of the literal fallbacks — but the substitution is written into the returned
- * `degradations` list instead of vanishing. `identity` is reported first and
- * `serving` second so the rendered line reads in the order this file declares the
- * sources. Nothing is printed from here: module load must stay byte-silent, and
+ * The `sources` member records **where each value came from** (see
+ * {@link FROM_ENVIRONMENT}); for `path` and `status` it is the only way to tell an
+ * adopted declaration from an absent or rejected one, since a legal declaration is by
+ * definition equal to the fallback. `degradations` records each substitution instead
+ * of letting it vanish, `identity` before `serving` so the rendered line follows the
+ * declaration order. Nothing is printed here — module load must stay byte-silent and
  * `server.js` renders the list once at start-up.
  *
  * @returns {{values: Readonly<{name: string, version: string, host: string, port: number, path: string, status: string}>, sources: Readonly<Object<string, string>>, degradations: ReadonlyArray<string>}}
@@ -850,20 +797,15 @@ let lastIssuedTimestampMs = -1;
  * `timestamp`, including two that arrive inside the same millisecond and two that
  * straddle a backwards clock adjustment.
  *
- * Why that matters rather than being a nicety: freshness is the endpoint's proof
- * of *liveness* rather than of mere reachability. A process that had frozen after
- * binding its socket would keep serving a well-formed payload, and comparing two
- * consecutive responses is how a poller detects it — so "the two responses
- * happened to share a millisecond" must never be indistinguishable from "the
- * process stopped moving". A raw `Date.now()` read cannot make that distinction,
- * because this contract's precision is milliseconds and two probes can easily
- * land in one.
+ * Freshness is the endpoint's proof of *liveness* rather than of mere reachability,
+ * and comparing two consecutive responses is how a poller detects a process that
+ * froze after binding its socket. "The two responses shared a millisecond" must
+ * therefore never be indistinguishable from "the process stopped moving", which a raw
+ * `Date.now()` read cannot guarantee at millisecond precision.
  *
- * The correction is bounded and self-cancelling: it advances the issued value by
- * one millisecond per call only while calls arrive faster than the clock ticks,
- * and the moment real time catches up the wall clock wins again, so the value can
- * never drift persistently ahead of it. An endpoint answering a poller every few
- * seconds never enters that regime at all.
+ * The correction is bounded and self-cancelling: the issued value advances by one
+ * millisecond per call only while calls outpace the clock, and the wall clock wins
+ * again the moment real time catches up, so it can never drift persistently ahead.
  *
  * @returns {number} A millisecond value strictly greater than every value
  *   returned before.
@@ -914,23 +856,16 @@ function currentTimestamp() {
  * `uptime`, `pid`, `hostname`, `releaseId`, `description` or `checks` object: a
  * frozen contract with an extension point is a contract with a drift point.
  *
- * All three stable members come from the configuration resolved once at module
- * load, so nothing is hard-coded at this point of use. `status` reaches
- * {@link config} only through {@link resolveFrozenValue}, which adopts a declared
- * value only when it is exactly {@link STATUS_UP} and rejects every other, so this
- * member is simultaneously read from its declared source *and* impossible for a
- * deployment to change: `config.status === STATUS_UP` holds for every
- * configuration, valid or hostile.
- * `timestamp` is evaluated here, on every call, through {@link currentTimestamp},
- * and is what makes the response proof of *liveness* rather than merely proof of
- * reachability: a process that had frozen after binding its socket could otherwise
- * keep serving a stale but well-formed payload and be called healthy. See
- * {@link nextTimestampMs} for why the value is additionally required to be strictly
- * later than the one before it, which is what makes that comparison conclusive even
- * for two probes that land inside the same millisecond.
+ * All three stable members come from the configuration resolved once at module load,
+ * so nothing is hard-coded at this point of use. `status` reaches {@link config} only
+ * through {@link resolveFrozenValue}, so it is simultaneously read from its declared
+ * source *and* impossible for a deployment to change: `config.status === STATUS_UP`
+ * holds for every configuration, valid or hostile. `timestamp` is evaluated here on
+ * every call through {@link currentTimestamp}; see {@link nextTimestampMs} for why it
+ * must also be strictly later than the one before it.
  *
- * The object is returned unfrozen and uncached: each call is an independent
- * snapshot the caller may serialize, assert against or discard.
+ * The object is returned unfrozen and uncached: each call is an independent snapshot
+ * the caller may serialize, assert against or discard.
  */
 function buildHealthPayload() {
   return {
@@ -1226,47 +1161,32 @@ function destroyResponse(res) {
 /**
  * Completion path for a failure the handler has no defined response for.
  *
- * **No status is invented here, and that is the whole design.** The contract
- * defines exactly three responses — `200`, `405` and `404` — because a routed
- * request performs no I/O and so has no failure path: it reads one
- * already-resolved value set and one clock. This branch is therefore unreachable
- * on every contract path, and a fault reaching it must not be answered with a
- * status the contract does not contain. All three tiers behave identically: report
- * the fault server-side, then complete the exchange at the transport level.
+ * **No status is invented here, and that is the whole design.** A routed request
+ * performs no I/O — one already-resolved value set and one clock — so it has no
+ * failure path and this branch is unreachable on every contract path. It exists so
+ * that an exception can never escape the request listener, which would either crash
+ * the process (turning a health endpoint into an outage) or leave the client waiting
+ * on a socket that is never answered.
  *
- * It exists at all so that an exception can never escape the request listener: an
- * escaping exception would either crash the process (turning a health endpoint
- * into an outage) or leave the client waiting on a socket that is never answered.
+ * Four deliberate refusals:
  *
- * Four things it deliberately does not do:
+ *   - **Never `404`.** That is a statement about the *client's* request target, so
+ *     using it here blames the caller for this process's defect: a poller records a
+ *     clean contract-shaped `404` and the real fault leaves no trace.
+ *   - **Never `2xx`.** A fault must not be reported as health.
+ *   - **Never an invented `5xx`.** An out-of-contract status is one a probe would
+ *     have to be taught about, and only a defect can produce it. Closing the
+ *     connection is the honest transport-level outcome and probes already read it as
+ *     unhealthy.
+ *   - **Never silent.** A bare close is indistinguishable from a network blip, so a
+ *     genuine defect emits one sanitized line naming the category and the
+ *     consequence; an expected peer disconnect says nothing.
  *
- *   - **It never answers `404`.** A `404` is a statement about the *client's*
- *     request target — "the resource you asked for does not exist here" — so
- *     returning it after an internal failure attributes this process's defect to
- *     the caller. A poller would record a clean, contract-shaped `404`, a human
- *     would go looking for a typo in a URL that was in fact correct, and the real
- *     defect would leave no trace anywhere.
- *   - **It never answers `2xx`.** A fault must never be reported as health.
- *   - **It never invents a `5xx` either.** A status outside the contract is a
- *     status a probe would have to be taught about, and teaching a probe about a
- *     response that only a defect can produce is how an out-of-contract code ends
- *     up being relied on. Closing the connection is the honest transport-level
- *     outcome, and a probe already treats it as unhealthy.
- *   - **It never fails silently.** Closing the connection on its own is
- *     indistinguishable from a network blip, so the failure is recorded
- *     server-side: the operator sees the cause, and the client is never sent a
- *     fabricated success.
- *
- * The resulting behavior, by what the client has already received: nothing yet —
- * the connection is destroyed without a status line; a response in flight — it is
- * ended, because the status line cannot be retracted. An expected peer disconnect
- * says nothing on stderr; a genuine defect emits one sanitized line naming the
- * category and the consequence. In no case is any exception detail reflected to
- * the client.
- *
- * This is the internal-fault policy of `docs/health-endpoint.md` §9.3.1, which is
- * canonical for all three tiers: report server-side, never `404`, never `2xx`,
- * never a status outside the contract, reflect nothing.
+ * Behaviour by what the client already received: nothing yet — the connection is
+ * destroyed without a status line; a response in flight — it is ended, because the
+ * status line cannot be retracted. No exception detail is ever reflected to the
+ * client. This is the internal-fault policy of `docs/health-endpoint.md` §9.3.1,
+ * canonical for all three tiers.
  *
  * @param {import('node:http').ServerResponse} res Response to finalize.
  * @param {unknown} [error] The caught value, used only for classification and
@@ -1309,34 +1229,25 @@ function finalizeAfterUnexpectedError(res, error) {
 /**
  * Applies the contract's routing rule and returns the response to be written.
  *
- * The single source of the routing decision at this tier, shared by both response
- * paths this module has: {@link handleRequest}, which writes through a
- * `ServerResponse`, and the socket-level {@link handleConnect} /
- * {@link handleUpgrade}, which are handed a bare socket and write through
- * {@link writeRawResponse}. Duplicating the method-then-path decision in the
- * socket-level handlers is how a second, undocumented routing behaviour would
+ * The single source of the routing decision at this tier, shared by {@link
+ * handleRequest} (which writes through a `ServerResponse`) and the socket-level
+ * {@link handleConnect} / {@link handleUpgrade} (handed a bare socket, writing
+ * through {@link writeRawResponse}). Duplicating the method-then-path decision in
+ * the socket-level handlers is how a second, undocumented routing behaviour would
  * appear on the same port.
  *
- * The **routing decision** is deterministic in the method and the raw request
- * target alone. The **payload is not**: the success path builds a fresh one, which
- * reads the clock, so this function is not pure and repeated calls with identical
- * arguments differ in `timestamp`. It touches nothing else — no I/O beyond the
- * already-resolved configuration.
+ * The **routing decision** is deterministic in the method and the raw request target
+ * alone. The **payload is not**: the success path builds a fresh one, which reads the
+ * clock, so this function is **not pure** and repeated calls with identical arguments
+ * differ in `timestamp`. It performs no I/O beyond the already-resolved configuration.
  *
- * Routing order is normative, not incidental:
+ * Routing order is normative: **method first**, so `POST /unknown` is a `405` and a
+ * caller learns the most actionable fact first; then the raw origin-form path
+ * compared for exact equality against the frozen path, with the query ignored and
+ * nothing else (see {@link requestTargetPath}); then success.
  *
- *   1. **Method first.** `POST /health` returns `405`, and so does `POST /unknown`
- *      — the request never reaches the path comparison, so a caller always learns
- *      the most actionable fact first: that its method is not permitted anywhere
- *      on this server.
- *   2. **Then the raw origin-form path, compared for exact equality against the
- *      frozen path.** A query string is ignored; nothing else is. See
- *      {@link requestTargetPath}.
- *   3. **Then success**, with a freshly built, compactly serialized payload.
- *
- * Method names are compared case-insensitively as a defensive measure for direct
- * invocation by unit tests; over the wire Node's HTTP parser only ever surfaces
- * canonical uppercase method tokens.
+ * Method names are compared case-insensitively as a defence for direct invocation by
+ * unit tests; over the wire Node's parser only surfaces canonical uppercase tokens.
  *
  * @param {string|undefined} method The request method, as the runtime reports it.
  * @param {string|undefined} requestTarget The raw request target, verbatim.
@@ -1415,24 +1326,20 @@ function handleRequest(req, res) {
  *
  * Three properties are deliberate:
  *
- *   - **One `socket.end` call.** The status line, the header block and the body are
- *     concatenated and handed over together, which saves a round trip. How the
- *     transport then frames those bytes is its own business, and the contract says
+ *   - **One `socket.end` call**, with status line, headers and body concatenated. How
+ *     the transport then frames those bytes is its own business and the contract says
  *     nothing about it (`docs/health-endpoint.md` §9.5).
- *   - **`Connection: close`.** Every request that reaches this function was
- *     refused at or below the protocol layer, so the connection's framing can no
- *     longer be trusted for reuse. Closing is the only safe framing, and it is
- *     what the runtime would have done anyway.
- *   - **Reason phrases from `http.STATUS_CODES`.** The runtime's own table, so a
- *     status line is never hand-spelled.
+ *   - **`Connection: close`.** Every request reaching here was refused at or below the
+ *     protocol layer, so the connection's framing can no longer be trusted for reuse.
+ *   - **Reason phrases from `http.STATUS_CODES`**, so a status line is never
+ *     hand-spelled.
  *
- * The header order matches {@link writeJsonResponse}: caller-supplied headers
- * (only ever `Allow`) first, then the contract headers, so a caller can add but
- * never override.
+ * Header order matches {@link writeJsonResponse}: caller-supplied headers (only ever
+ * `Allow`) first, then the contract headers, so a caller can add but never override.
  *
- * It never throws. A socket refused at the protocol layer may already be gone, and
- * an exception escaping an event handler would take the process with it — which
- * would turn a malformed request from one client into an outage for every client.
+ * It never throws. A socket refused at the protocol layer may already be gone, and an
+ * exception escaping an event handler would turn one malformed request into an outage
+ * for every client.
  *
  * @param {import('node:net').Socket} socket The socket to answer on.
  * @param {{statusCode: number, json: string, omitBody?: boolean, extraHeaders?: (Object|null)}} outcome
@@ -1670,34 +1577,27 @@ function createHealthServer() {
  * (the unit suite).
  *
  * `config` is the single resolved source of every served value; `name`, `version`,
- * `host`, `port`, `path` and `status` mirror its members at the top level, and
- * `healthPath` / `HEALTH_PATH` name the resource path under the two other
- * conventions a consumer may reasonably expect. Every one of those is the same
- * already-resolved value — there is no second resolution and no drift.
+ * `host`, `port`, `path`, `status`, `healthPath` and `HEALTH_PATH` all mirror its
+ * members under the conventions a consumer may expect, every one the same
+ * already-resolved value, so there is no second resolution and no drift.
  *
- * `configSources` reports which link of each chain supplied each resolved value.
- * For `path` and `status` it is the only way to tell an adopted declaration
- * (`file`) from an absent or rejected one (`fallback`), because the only legal
- * declaration for either is by definition equal to the fallback. `STATUS_UP` is the
- * contract's status literal, exported so a consumer compares against the contract
- * rather than a retyped string, and `declaredStatus` reports what a document
- * declares *before* validation.
+ * `configSources` reports which link of each chain supplied each value — for `path`
+ * and `status` the only way to tell an adopted declaration (`file`) from an absent or
+ * rejected one (`fallback`), since the only legal declaration equals the fallback.
+ * `STATUS_UP` lets a consumer compare against the contract rather than a retyped
+ * string, and `declaredStatus` reports what a document declares *before* validation.
  *
  * The diagnostics surface — `configDegradations`,
  * `describeConfigurationDegradation`, `reportedHandlerFailures` and
- * `frozenValueConflicts` — makes the two conditions this module survives silently
- * by design *observable*: a configuration source that failed to supply its values,
- * and an unexpected handler failure. They are recorded here and rendered by
- * `server.js`, which keeps module load byte-silent while still leaving an operator
- * something to act on.
+ * `frozenValueConflicts` — makes the two conditions this module survives silently by
+ * design observable, recorded here and rendered by `server.js` so module load stays
+ * byte-silent.
  *
- * `requestTargetPath` and `resolveContractResponse` are exported so the suite can
- * assert the routing decision — spelling by spelling, then method-then-path-then-
- * payload — without binding a socket. `handleConnect`, `handleUpgrade` and
- * `handleClientError` are exported for the same reason: each answers a request
- * `node:http` would otherwise leave unanswered, so each needs asserting on its own.
- * `currentTimestamp` and `formatTimestamp` are exported so freshness is assertable
- * directly, the second rendering a chosen instant to make the whole-second case
+ * The rest are exported for assertability without a socket: `requestTargetPath` and
+ * `resolveContractResponse` for the routing decision; `handleConnect`,
+ * `handleUpgrade` and `handleClientError` because each answers a request `node:http`
+ * would otherwise leave unanswered; `currentTimestamp` and `formatTimestamp` for
+ * freshness, the second rendering a chosen instant so the whole-second case is
  * deterministic.
  */
 module.exports = {

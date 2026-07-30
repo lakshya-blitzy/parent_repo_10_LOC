@@ -23,28 +23,22 @@
  *     environment variable  ->  configuration file  ->  compiled-in literal
  *          HOST / PORT            config/health.json        0.0.0.0 / 3000
  *
- * This tier's override names are exactly `HOST` and `PORT`; Levels 2 and 3
- * deliberately use the prefixed `HEALTH_HOST` and `HEALTH_PORT` names instead,
- * and that asymmetry is intentional and must not be "harmonized". The middle link
- * is parsed once, by `health.js`, and consumed here through its resolved `config`
- * export, so `config/health.json` is read in exactly one place in the tier and the
- * two cannot drift apart. The literals below are the last link, and they are
- * required rather than decorative: they guarantee the listener still binds and
- * still serves a valid contract when the configuration file is missing, which is
- * precisely the failure a health endpoint has to survive.
+ * The override names here are exactly `HOST` and `PORT`; Levels 2 and 3 deliberately
+ * use the prefixed `HEALTH_HOST` / `HEALTH_PORT` names, and that asymmetry must not be
+ * "harmonized". The middle link is parsed once, by `health.js`, and consumed through
+ * its resolved `config` export, so `config/health.json` is read in exactly one place
+ * and the two cannot drift. The literals are required rather than decorative: the
+ * listener must still bind and serve a valid contract when the file is missing.
  *
- * A single listener is the whole requirement, so there is deliberately no
- * clustering, worker thread, child process, daemonization, PID file, restart loop,
- * self-polling timer, extra route, middleware, TLS termination, authentication,
- * rate limiting or logging framework. The only module required here is the
- * tier-local `./health.js`; nothing outside this repository tier is referenced,
- * which is what keeps the composition's levels runtime-independent.
+ * A single listener is the whole requirement, so there is deliberately no clustering,
+ * worker thread, child process, daemonization, PID file, restart loop, self-polling
+ * timer, extra route, middleware, TLS termination, authentication, rate limiting or
+ * logging framework. The only module required is the tier-local `./health.js`, so
+ * nothing outside this tier is referenced and the levels stay runtime-independent.
  *
- * Nothing is logged per request: the endpoint has to stay lightweight, and
- * per-request logging would add work to a probe and bury the real output of an
- * automated run in noise. This file logs its bound address once at start-up, one
- * line on shutdown, and diagnostics on standard error when something actually
- * goes wrong.
+ * Nothing is logged per request — that would add work to a probe and bury the real
+ * output of an automated run in noise. This file logs its bound address once at
+ * start-up, one line on shutdown, and diagnostics on stderr when something goes wrong.
  *
  * @module server
  * @see health.js — the payload builder, request handler and server factory
@@ -482,23 +476,18 @@ function shutdown(server, signal) {
  * Announce, exactly once, that a declared configuration source failed to supply
  * its values.
  *
- * `health.js` survives a missing, unreadable, malformed or empty configuration
- * source by falling back to compiled-in literals, and that resilience is a
- * requirement: an endpoint that refuses to answer because of its own configuration
- * turns a running application into one that reports itself unhealthy. But
- * resilience without a report is indistinguishable from correctness. The failure
- * mode this closes is a real and quiet one — a deployment assembled without
- * `config/health.json`, or with the file excluded by an over-broad ignore
- * pattern, serves a perfectly valid `200` carrying fallback identity, so any
- * automated check that only looks at the response would pass. Every signal would
- * say healthy while the payload no longer describes the build it came from.
+ * `health.js` survives a missing, unreadable, malformed or empty source by falling
+ * back to compiled-in literals, because an endpoint that refuses to answer over its
+ * own configuration turns a running application into one that reports itself
+ * unhealthy. But resilience without a report is indistinguishable from correctness: a
+ * deployment assembled without `config/health.json` serves a perfectly valid `200`
+ * carrying fallback identity, so a check that only looks at the response passes while
+ * the payload no longer describes the build it came from.
  *
- * Reporting happens here rather than in `health.js` for one hard reason: requiring
- * `health.js` must stay byte-silent on both streams, because the unit suite loads
- * it in a child process and asserts that nothing was written. A module that logs
- * at import time also logs when a test imports it, when a tool introspects it, and
- * twice when something loads it under two specifiers. The module records; the
- * entry point — a process that is deliberately about to serve traffic — reports.
+ * Reporting happens here rather than in `health.js` because requiring that module must
+ * stay byte-silent on both streams — the suite loads it in a child process and asserts
+ * nothing was written, and a module that logs at import time also logs when a tool
+ * introspects it. The module records; the entry point reports.
  *
  * `stderr` is the correct stream: this is diagnostic output about a degraded
  * condition, and keeping `stdout` to exactly the one start-up line means a
@@ -532,22 +521,17 @@ const MAX_CONFIGURED_LENGTH = 64;
 /**
  * Render a rejected configured value safely inside a one-line diagnostic.
  *
- * The value reaching here was read out of `config/health.json`, so its content is
- * chosen by whoever can edit that file — exactly the trust boundary that makes
- * every host diagnostic a log-injection sink, and the reason {@link sanitizeHost}
- * exists. A `path` of `"/x\nhealth server listening on http://0.0.0.0:3000/health"`
- * would otherwise emit a second line that a log collector parses as a separate
- * event and that reads precisely like this server's own successful start-up
- * announcement. The other two members of a conflict record — `key` and `frozen` —
- * come from the frozen table compiled into `health.js`, never from a document, so
- * they are rendered as they are.
+ * Same trust boundary and same log-injection risk as {@link sanitizeHost}: the value
+ * was read out of `config/health.json`. A `path` of
+ * `"/x\nhealth server listening on http://0.0.0.0:3000/health"` would otherwise emit
+ * a second line a collector parses as a separate event, reading precisely like this
+ * server's own start-up announcement. A conflict record's `key` and `frozen` members
+ * come from the frozen table compiled into `health.js`, so they are rendered as-is.
  *
- * Unlike a host, a rejected value cannot be replaced wholesale: naming what was
- * configured is the entire point of the message, since an operator who cannot see
- * their own value has no way to find the line they need to delete. So this bounds
- * the length and substitutes a space for every character that cannot be printed,
- * which keeps one logical diagnostic on one physical line — the same treatment,
- * and the same reasoning, as the Level 2 sibling's diagnostic sink.
+ * Unlike a host, a rejected value cannot be replaced wholesale — naming what was
+ * configured is the point, since an operator who cannot see their own value cannot
+ * find the line to delete. So the length is bounded and every unprintable character
+ * becomes a space, keeping one logical diagnostic on one physical line.
  *
  * @param {unknown} value The rejected value, as recorded by the audit; a
  *   configuration document may hold a non-string, so anything may arrive.
@@ -574,23 +558,17 @@ function sanitizeConfiguredValue(value) {
  * Report, once at start-up, any configured value that was rejected for trying to
  * redefine a frozen contract value.
  *
- * The resource path and the `status` literal are resolved from
- * `config/health.json` like every other setting, but their declarations are
- * validated against the contract first: only the contract's own literal is
- * adopted, and anything else is refused so that `health.js` serves the frozen
- * value whatever the document says. Serving the right thing is not by itself
- * enough, though: a deployment that edited `config/health.json` expecting an
- * effect would otherwise get silence, and would discover the truth only from a
+ * `health.js` serves the frozen value whatever the document says, but serving the
+ * right thing is not enough on its own: a deployment that edited `config/health.json`
+ * expecting an effect would otherwise get silence and discover the truth only from a
  * monitoring gap. One warning line per rejected value names the key, what was
  * configured and what is served instead.
  *
- * Written to standard error because it reports a misconfiguration rather than
- * normal progress, and emitted here rather than inside `health.js` because that
- * module must stay importable without side effects. Nothing is printed by a
- * correctly configured deployment, which is why this cannot add noise to a CI log.
- *
- * The configured value is passed through {@link sanitizeConfiguredValue} first,
- * because it is a document-supplied string being rendered into a log line.
+ * On standard error, because it reports a misconfiguration rather than normal
+ * progress, and emitted here rather than in `health.js` because that module must stay
+ * importable without side effects. A correctly configured deployment prints nothing.
+ * The configured value goes through {@link sanitizeConfiguredValue} first, being a
+ * document-supplied string rendered into a log line.
  *
  * @returns {number} How many lines were written, for the unit suite's benefit.
  */
