@@ -1,0 +1,92 @@
+# Ignore rules for the apex (Level 1) JavaScript tier.
+#
+# `git status --porcelain --untracked-files=all` must print nothing after a full
+# check, test, serve and container cycle. That emptiness is an asserted gate, not
+# a nicety. No ignore rules existed here before the /health endpoint was added
+# because nothing in this repository had ever been executed -- there was no
+# residue to ignore. Running `node --test` with a coverage reporter, running an
+# npm script, or redirecting server output changes that, and every pattern below
+# exists because one of those produces the file it names.
+#
+# Scope is this repository only. `child_repo_10_LOC` is a submodule -- a separate
+# Git repository with its own index and its own ignore rules -- so these patterns
+# neither reach into it nor need to. Python residue (`__pycache__/`, `*.pyc`)
+# belongs to Level 2's own file and Java residue (`*.class`) to Level 3's; nothing
+# below is borrowed from another language, because this tier cannot produce it.
+#
+# Every pattern here is deliberately narrow. The tracked payload at this tier is
+# small and all of it is load-bearing, so a broad pattern is expensive. `*.json`
+# would silence package.json and config/health.json -- health.js reads both and
+# falls back to compiled-in literals rather than failing, so losing them would
+# leave the endpoint answering 200 with an identity this repository never
+# declared, a failure with no symptom. `config/` and `docs/` would silence the
+# serving configuration and the normative contract, `*.yml` the workflow, `test*`
+# and `*.test.js` the contract test suite, and a bare `.env*` the tracked
+# .env.example template. None of those appears below, and any future edit should
+# be checked with `git check-ignore -v <path>` rather than by reading.
+
+# Installed dependency tree, plus the npm cache when it is redirected into the
+# repository with `npm --cache .npm`. This tier has no dependencies at all --
+# every module it loads is a Node built-in -- so these two lines are defensive:
+# an accidental `npm install` must never become a committable directory.
+node_modules/
+.npm/
+
+# Local environment file. It is the one untracked file in this workflow: it holds
+# real values for the two variables .env.example documents, and a real value does
+# not belong in history.
+#
+# The names are spelled out one at a time instead of using `.env*` precisely so
+# that .env.example -- a tracked, reviewed template carrying no real value --
+# stays visible to Git. No negation such as `!.env.example` is needed, and none is
+# used, because no pattern here matches that name in the first place.
+.env
+.env.local
+.env.*.local
+
+# Run and log residue. `npm-debug.log` appears when an npm script fails, and a
+# plain `*.log` covers redirected server output such as
+# `node server.js > server.log 2>&1`, which is how this endpoint is started in the
+# background both locally and in continuous integration. `logs/` covers the same
+# output collected into a directory. No tracked file at this tier ends in `.log`.
+npm-debug.log*
+*.log
+logs/
+
+# Coverage output. `node --test --experimental-test-coverage` with the lcov
+# reporter writes `lcov.info` beside package.json, and `NODE_V8_COVERAGE=coverage`
+# writes a directory of raw V8 profiles. Both are per-run artefacts produced *by*
+# index.test.js and are never input *to* it -- the suite itself writes only under
+# the system temporary directory, so it leaves nothing else here.
+coverage/
+lcov.info
+*.lcov
+
+# Operating-system and editor scratch files. Short on purpose: these are the ones
+# that actually turn up, from a file manager or an interrupted `vi` session, and
+# they are never content.
+.DS_Store
+Thumbs.db
+*.swp
+
+# Deliberately NOT ignored, each for a reason worth stating once:
+#
+#   child_repo_10_LOC   The submodule gitlink. It is first-class project source
+#                       rather than a vendored artefact -- it receives this same
+#                       feature at its own tier -- so no pattern here may match
+#                       its name, and none does.
+#   .gitmodules         Its declaration; tracked, and unchanged by this feature.
+#   package.json        Identity: the `name` and `version` the payload reports.
+#   config/health.json  Serving configuration: host, port, path, status literal.
+#   .env.example        The tracked template documenting PORT and HOST.
+#   .nvmrc              The Node version pin, single-sourced for CI and readers.
+#   index.js            The application, whose five-line legacy output a
+#                       regression gate fingerprints byte for byte.
+#   health.js           The payload builder and request handler, and the
+#   server.js           long-lived entry point that binds the listener.
+#   index.test.js       The contract test suite.
+#   Dockerfile          The container definition, and the build-context denylist
+#   .dockerignore       that excludes *this* file from an image -- the mirror
+#                       image of what this file does for Git.
+#   README.md docs/     Documentation, including the normative contract document.
+#   .github/workflows/  The workflow that asserts the gate described at the top.

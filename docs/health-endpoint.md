@@ -2,7 +2,7 @@
 
 **This document is the single normative definition of the `/health` endpoint** served by every application in the `parent_repo_10_LOC` submodule composition. Three independent applications — written in three different languages, living in three separate Git repositories — implement this one contract identically. It is defined once, here, at the apex of the composition precisely so that those three implementations cannot drift apart, and the Level 2 and Level 3 READMEs are required to reference it **by documented location only**, never by a relative link into another repository's tree (§1.2). Where this document and an implementation disagree, this document is correct and the implementation carries the defect.
 
-It is a **specification, not an inventory**: it states what every tier MUST do, and parts of the feature it defines — the workflows of §12.1, and the Level 1 and Level 2 README sections of §14 — are still to be created. The container definitions of §11 are no longer among them: all three tiers now carry a `Dockerfile` and a `.dockerignore`. Each section says plainly which of its claims describe the tree as it stands and which are requirements on work still to come.
+It is a **specification, not an inventory**: it states what every tier MUST do, and one part of the feature it defines — the workflows of §12.1 — is still to be created. The container definitions of §11 are no longer among them, and neither are the per-tier README sections: all three tiers now carry a `Dockerfile`, a `.dockerignore` and their own README section. Each section says plainly which of its claims describe the tree as it stands and which are requirements on work still to come.
 
 ## 1. Scope, audience and the level-independence boundary
 
@@ -16,7 +16,7 @@ It is a **specification, not an inventory**: it states what every tier MUST do, 
 
 `child_repo_10_LOC` is a Git submodule of `parent_repo_10_LOC`, and `nested_child_repo_10_LOC` is in turn a Git submodule of `child_repo_10_LOC`. All three are first-class project source, and none may be reduced to a pin bump: **every tier MUST carry its own implementation of this contract, its own configuration, its own container definition, its own workflow and its own tests.** No tier receives a subset of those artifact classes.
 
-That requirement is the specification of the finished feature, and the tiers reach it incrementally. At the time of writing, all three tiers carry their implementation, their configuration, their tests and their container definition, and the Level 3 README section is written as well. What remains a required deliverable rather than a present file is the workflow at each tier, together with the Level 1 and Level 2 README sections; the sections below define both normatively. Each section states which of the two it is describing, so this document can be read as a specification without being mistaken for an inventory.
+That requirement is the specification of the finished feature, and the tiers reach it incrementally. At the time of writing, all three tiers carry their implementation, their configuration, their tests, their container definition and their own README section. What remains a required deliverable rather than a present file is the workflow at each tier; the sections below define it normatively. Each section states which of the two it is describing, so this document can be read as a specification without being mistaken for an inventory.
 
 ### 1.2 This document is documentation, and only documentation
 
