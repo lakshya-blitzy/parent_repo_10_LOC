@@ -351,20 +351,13 @@ const REFUSED_METHODS = Object.freeze([
 /**
  * Well-formed method tokens the runtime's parser does not recognise.
  *
- * Node validates the method token against its own table and refuses anything
- * outside it — including a correctly spelled method in the wrong case, since
- * methods are case-sensitive — before any request listener runs. Every token here
- * is nevertheless a valid RFC 9110 §5.6.2 `token`, so the *request line* is well
- * formed and only the method's value is unrecognised. The contract answers every
- * method other than `GET` and `HEAD` with `405`, drawing no distinction between one
- * the parser knows and one it does not, so all of these must be answered `405` with
- * `Allow: GET, HEAD` — which is also what the Python and Java tiers answer for the
- * same bytes.
- *
- * `CONNECT` belongs to this group by contract and not by mechanism: the runtime
- * recognises it perfectly well and routes it to the `'connect'` event instead of a
- * request listener, which is a different path to the same required answer. It is
- * asserted separately, in both of its target forms.
+ * Node refuses anything outside its own method table — including a correctly
+ * spelled method in the wrong case — before any request listener runs. Each token
+ * here is still a valid RFC 9110 §5.6.2 `token`, so the *request line* is well
+ * formed and only the method's value is unrecognised; the contract answers every
+ * method other than `GET` and `HEAD` with `405`, so all of these must be too.
+ * `CONNECT` belongs to the same group by contract but reaches it by a different
+ * route (the `'connect'` event), so it is asserted separately in both target forms.
  *
  * @type {ReadonlyArray<string>}
  */
@@ -373,15 +366,12 @@ const UNKNOWN_METHOD_TOKENS = Object.freeze(['FROBNICATE', 'get']);
 /**
  * Request lines that are malformed as *lines*, whatever method they name.
  *
- * RFC 9112 §3 fixes the request line as method, one space, target, one space,
- * version. A tab in place of that first space makes the line unparseable, and the
- * method token is not what is wrong with it — so the answer is `400`, not the
- * contract's `405`, and asserting that keeps the two populations of parser refusal
- * apart. Node reports both with the same error code, so a fix that answered them
- * identically would be answering one of them wrongly.
- *
- * Written as complete request lines rather than a method and a target, because the
- * defect being asserted *is* the delimiter.
+ * RFC 9112 §3 fixes the request line as method, space, target, space, version. A tab
+ * in place of that first space makes the line unparseable, and the method token is
+ * not what is wrong with it — so the answer is `400`, not `405`. Node reports both
+ * conditions under the same error code, so answering them identically would answer
+ * one of them wrongly. Written as complete lines because the defect *is* the
+ * delimiter.
  *
  * @type {ReadonlyArray<string>}
  */
@@ -399,21 +389,8 @@ const HEAD_BODY_SEPARATOR = CRLF + CRLF;
 /** Upper bound on a hand-written exchange, so a lost response fails rather than hangs. */
 const RAW_SOCKET_TIMEOUT_MS = 5000;
 
-/**
- * Sequential requests issued on one persistent connection, and the budget for them.
- *
- * The contract requires each response to leave in a single write, and the budget is
- * sized against the cost of missing that requirement rather than for comfort: the
- * sibling Python tier, writing head and body separately onto an unbuffered socket with
- * Nagle's algorithm enabled, took ~41 ms per keep-alive request instead of ~0.1 ms,
- * because the second segment waited for the peer to acknowledge the first. Three rounds
- * therefore cost upwards of 80 ms when the property is missing and well under 2 ms when
- * it holds, so 120 ms is diagnostic in both directions. The segment count is the
- * deterministic half of the assertion; this budget catches a stall arriving by any
- * other route.
- */
+/** Sequential requests issued on one persistent connection, to prove reuse works. */
 const KEEP_ALIVE_ROUNDS = 3;
-const KEEP_ALIVE_BUDGET_MS = 120;
 
 /** Status a tampered configuration file declares, which the payload must ignore. */
 const TAMPERED_STATUS = 'DOWN';
@@ -1159,17 +1136,14 @@ function rawRequest(port, method, target) {
 /**
  * Write one **complete request line** to a socket verbatim and read the response.
  *
- * The lower half of {@link rawRequest}, separated out because three of the
- * assertions in this file are about the request *line* itself rather than about a
- * method and a target: a tab where the single space belongs, a line with no method
- * at all, and an ordinary line carrying header fields that provoke a parser refusal
- * or an upgrade offer. None of those can be expressed as a method plus a target, and
- * every one of them must reach the server as the exact bytes written here.
+ * The lower half of {@link rawRequest}, separated out because some assertions here
+ * are about the request *line* itself — a tab where the space belongs, a line with no
+ * method, or a line carrying fields that provoke a parser refusal or an upgrade
+ * offer — none of which can be expressed as a method plus a target.
  *
- * `Host` and `Connection: close` are always appended — the first because RFC 9112
- * §3.2 requires it of an HTTP/1.1 request and its absence is a separate condition
- * not under test here, the second because it makes reading to end of stream a
- * complete read.
+ * `Host` and `Connection: close` are always appended: the first because RFC 9112
+ * §3.2 requires it and its absence is a separate condition, the second because it
+ * makes reading to end of stream a complete read.
  *
  * @param {number} port Loopback port to connect to.
  * @param {string} requestLine The request line, transmitted exactly as given.
@@ -1211,32 +1185,30 @@ function rawRequestLine(port, requestLine, fields = []) {
 }
 
 /**
- * Issue several sequential requests on ONE persistent connection, one segment at a time.
+ * Issue several sequential requests on ONE persistent connection.
  *
- * The only helper here that keeps a socket open across requests, and the only one that
- * reports the response *segment by segment* rather than concatenated. Both properties
- * are the point: the contract requires each response to leave in a single write
- * (`docs/health-endpoint.md` §9.5), and the way that requirement fails is a head
- * segment followed — tens of milliseconds later, once the peer acknowledges it — by a
- * body segment. A helper that concatenated the chunks, as {@link rawRequestLine} does,
- * would parse both spellings into the same result and assert nothing.
+ * The only helper here that keeps a socket open across requests. Each response is
+ * accumulated until the body reaches the length its own `Content-Length` declares,
+ * which is what makes "the response is complete" an HTTP-level fact rather than a
+ * guess about how the bytes happened to be delivered — the contract says nothing
+ * about transport framing (`docs/health-endpoint.md` §9.5), so nothing here counts
+ * chunks or times them.
  *
  * @param {number} port The listener's port.
  * @param {string} target The request target to send on every round.
  * @param {number} rounds How many sequential requests to issue on the one connection.
- * @returns {Promise<Array<{segments: number, first: string, elapsedMs: number}>>} One
- *   entry per round: how many chunks arrived before the declared body was complete, the
- *   first chunk verbatim, and the round trip in milliseconds.
+ * @returns {Promise<string[]>} One entry per round: that round's complete response —
+ *   status line, header block and the whole declared body — as received.
  */
 function keepAliveRounds(port, target, rounds) {
   return new Promise((resolve, reject) => {
-    const results = [];
+    const responses = [];
     let chunks = [];
-    let startedAt = 0;
+
+    const request = `GET ${target} HTTP/1.1${CRLF}Host: ${LOOPBACK}:${port}${CRLF}Connection: keep-alive${HEAD_BODY_SEPARATOR}`;
 
     const socket = net.connect(port, LOOPBACK, () => {
-      startedAt = performance.now();
-      socket.write(`GET ${target} HTTP/1.1${CRLF}Host: ${LOOPBACK}:${port}${CRLF}Connection: keep-alive${HEAD_BODY_SEPARATOR}`, 'latin1');
+      socket.write(request, 'latin1');
     });
 
     socket.setTimeout(RAW_SOCKET_TIMEOUT_MS, () => {
@@ -1254,27 +1226,26 @@ function keepAliveRounds(port, target, rounds) {
       }
 
       const declared = /content-length:\s*(\d+)/i.exec(raw.slice(0, separatorAt));
-      const body = raw.slice(separatorAt + HEAD_BODY_SEPARATOR.length);
+      const bodyAt = separatorAt + HEAD_BODY_SEPARATOR.length;
 
-      if (declared === null || body.length < Number(declared[1])) {
+      if (declared === null || raw.length - bodyAt < Number(declared[1])) {
         return;
       }
 
-      results.push({
-        segments: chunks.length,
-        first: chunks[0].toString('latin1'),
-        elapsedMs: performance.now() - startedAt,
-      });
-      chunks = [];
+      // One complete response, ending exactly where its declared length says it ends.
+      // Anything beyond that belongs to the next round's response and is carried over,
+      // so a peer that pipelined its writes cannot bleed one response into another.
+      const end = bodyAt + Number(declared[1]);
+      responses.push(raw.slice(0, end));
+      chunks = raw.length > end ? [Buffer.from(raw.slice(end), 'latin1')] : [];
 
-      if (results.length === rounds) {
+      if (responses.length === rounds) {
         socket.end();
-        resolve(results);
+        resolve(responses);
         return;
       }
 
-      startedAt = performance.now();
-      socket.write(`GET ${target} HTTP/1.1${CRLF}Host: ${LOOPBACK}:${port}${CRLF}Connection: keep-alive${HEAD_BODY_SEPARATOR}`, 'latin1');
+      socket.write(request, 'latin1');
     });
   });
 }
@@ -1587,6 +1558,13 @@ function createResponseDouble(behavior = {}) {
     statusCode: null,
     headers: null,
     endCalls: 0,
+    // Every `write` the handler performs before ending the response. The contract
+    // requires the whole response to leave in ONE logical write, so this array must
+    // stay empty: the body belongs to the single `end(body)` call. Recording the
+    // calls rather than omitting the method is what turns that requirement into an
+    // assertion — an omitted method would surface as a TypeError from deep inside
+    // the handler, which reads as a crash rather than as a contract violation.
+    writes: [],
     body: null,
     destroyed: false,
   };
@@ -1595,6 +1573,11 @@ function createResponseDouble(behavior = {}) {
     headersSent: false,
     writableEnded: false,
     destroyed: false,
+
+    write(chunk) {
+      recorded.writes.push(chunk);
+      return true;
+    },
 
     writeHead(statusCode, headers) {
       recorded.writeHeadCalls += 1;
@@ -3435,15 +3418,11 @@ describe('health.js — one resource, one spelling, asserted on the wire', () =>
   });
 
   test('a method token the runtime does not recognise is still refused with the contract 405', async () => {
-    // Node's HTTP parser validates the method token against its own table and
-    // refuses anything outside it before any request listener is entered — so
-    // without the `'clientError'` listener `createHealthServer` attaches, the
-    // runtime answers a bodyless `400` here and the three tiers disagree about a
-    // case the contract explicitly covers ("any other method returns 405"). The
-    // request line is well formed and only the method's *value* is unrecognised, so
-    // the contract's answer is the same as for any other refused method: `405`,
-    // `Allow: GET, HEAD`, and the machine-readable error body. The Python and Java
-    // tiers answer these exact bytes the same way.
+    // The parser refuses an unrecognised token before any request listener runs, so
+    // without the `'clientError'` listener the runtime answers a bodyless `400` for a
+    // case the contract covers ("any other method returns 405"). The request line is
+    // well formed and only the method's value is unrecognised, so the answer is the
+    // ordinary `405` with `Allow` and the error body.
     for (const token of UNKNOWN_METHOD_TOKENS) {
       const response = await rawRequest(boundPort, token, HEALTH_PATH);
 
@@ -3460,12 +3439,10 @@ describe('health.js — one resource, one spelling, asserted on the wire', () =>
   });
 
   test('CONNECT is refused with the contract 405 in both of its target forms, never with silence', async () => {
-    // `CONNECT` never reaches a request listener: Node routes it to the `'connect'`
-    // event, and a server with no listener for that event destroys the socket
-    // without writing anything at all — the client waits for its own timeout and
-    // learns nothing. Both target forms are asserted because a tunnel request
-    // legitimately carries authority-form, and the answer must not depend on the
-    // target: the contract evaluates the method first.
+    // With no `'connect'` listener the runtime destroys the socket unanswered, so the
+    // client waits out its own timeout. Both target forms are asserted because a
+    // tunnel request legitimately carries authority-form and the answer must not
+    // depend on the target: the contract evaluates the method first.
     for (const target of [HEALTH_PATH, `${LOOPBACK}:${boundPort}`]) {
       const response = await rawRequest(boundPort, 'CONNECT', target);
 
@@ -3482,12 +3459,9 @@ describe('health.js — one resource, one spelling, asserted on the wire', () =>
   });
 
   test('an upgrade offer is declined and the request underneath it is answered as sent', async () => {
-    // An `Upgrade` request is routed to the `'upgrade'` event, and with no listener
-    // it is destroyed unanswered exactly as `CONNECT` is. This server speaks no
-    // upgrade protocol, so it declines to switch and answers the request as sent —
-    // which for `GET /health` is the ordinary `200`, the same answer the Python and
-    // Java tiers give, neither of which has any notion of an upgrade. `101` must
-    // never appear.
+    // Destroyed unanswered with no `'upgrade'` listener, exactly as `CONNECT` is.
+    // This server speaks no upgrade protocol, so it declines to switch and answers
+    // the request as sent: for `GET /health` that is the ordinary `200`, never `101`.
     const response = await rawRequestLine(
       boundPort,
       `GET ${HEALTH_PATH} HTTP/1.1`,
@@ -3509,13 +3483,11 @@ describe('health.js — one resource, one spelling, asserted on the wire', () =>
   });
 
   test('a malformed request line is a 400, and is told apart from an unrecognised method', async () => {
-    // The counterweight to the `405` above, and the reason the fix cannot simply map
-    // the parser's error code to one status: Node reports a tab where RFC 9112 §3
-    // requires a space with the *same* `HPE_INVALID_METHOD` code as `FROBNICATE`. The
-    // line itself is malformed there — the method token is not what is wrong with it
-    // — so claiming "method not allowed" would misdirect whoever reads it. `400` is
-    // the honest answer, and it now carries the contract's headers and a
-    // machine-readable body instead of the runtime's bare status line.
+    // The counterweight to the `405` above, and why the error code alone cannot decide
+    // the status: Node reports a tab where RFC 9112 §3 requires a space under the same
+    // `HPE_INVALID_METHOD` code as `FROBNICATE`. The line is malformed there, so
+    // "method not allowed" would misdirect the reader — `400` is the honest answer,
+    // now carrying the contract's headers and a machine-readable body.
     for (const requestLine of MALFORMED_REQUEST_LINES) {
       const response = await rawRequestLine(boundPort, requestLine);
 
@@ -3532,10 +3504,9 @@ describe('health.js — one resource, one spelling, asserted on the wire', () =>
   });
 
   test('an oversized header block is refused with 431 and the listener survives it', async () => {
-    // The third population of parser refusal, and the one whose status the fix must
-    // *preserve*: an over-long header block is `431`, which is both the RFC-correct
-    // answer and what Node itself would have sent. Asserting it proves the
-    // `'clientError'` listener changed the status for one population only.
+    // The third population of parser refusal, and the one whose status must be
+    // preserved: `431` is both RFC-correct and what Node itself would have sent, so
+    // asserting it proves the listener changed the status for one population only.
     const response = await rawRequestLine(
       boundPort,
       `GET ${HEALTH_PATH} HTTP/1.1`,
@@ -3551,54 +3522,62 @@ describe('health.js — one resource, one spelling, asserted on the wire', () =>
     assertContractPayload(JSON.parse(stillServing.body), 'after an oversized header block');
   });
 
-  test('each response on a persistent connection arrives in a single segment', async () => {
-    // A latency requirement rather than a content one, and the only one in this file
-    // that a status-and-headers assertion cannot see. The contract requires the whole
-    // response — status line, header block and body — to leave in one write, because the
-    // alternative is a head segment followed by a body segment that a transport may hold
-    // until the peer acknowledges the first: measured at ~41 ms per request at the
-    // sibling Python tier before it was fixed, against ~0.1 ms of actual work, and only
-    // ever on a persistent connection, which is exactly how an orchestrator polls.
+  test('every response on a persistent connection is complete, correct and freshly built', async () => {
+    // A connection an orchestrator keeps open is the normal polling shape, and the one
+    // place a response could be truncated or a cached body replayed without any
+    // single-request assertion noticing: a handler that framed its response for a
+    // connection that closes, or captured the payload once, answers the first request
+    // correctly and the rest wrongly. Each round is therefore read to the length its
+    // own `Content-Length` declares and checked as HTTP — status line, contract
+    // headers, complete conformant payload — plus a distinct `timestamp` per round.
     //
-    // This tier gets the property from `ServerResponse`, which coalesces, and from
-    // `node:http` setting `TCP_NODELAY` on accepted sockets. It is asserted anyway: the
-    // requirement is about the bytes on the wire, not about which layer produced them,
-    // and a future change to the write path here would otherwise be invisible.
+    // Nothing here counts TCP segments or milliseconds: receive chunking and
+    // scheduling are the kernel's decisions, so either assertion would reject a
+    // correct implementation on a loaded runner. The contract's "one logical write"
+    // clause (`docs/health-endpoint.md` §9.5) is asserted where it is deterministic —
+    // the recording response double and the recording socket double in the two groups
+    // below count the writes the handler itself performs.
     const rounds = await keepAliveRounds(boundPort, HEALTH_PATH, KEEP_ALIVE_ROUNDS);
 
     assert.strictEqual(rounds.length, KEEP_ALIVE_ROUNDS, 'every round must complete');
 
-    let total = 0;
-    for (const [index, round] of rounds.entries()) {
+    const timestamps = new Set();
+    for (const [index, response] of rounds.entries()) {
+      const label = `keep-alive round ${index + 1}`;
+      const separatorAt = response.indexOf(HEAD_BODY_SEPARATOR);
+      const head = response.slice(0, separatorAt);
+      const body = response.slice(separatorAt + HEAD_BODY_SEPARATOR.length);
+
+      assert.ok(response.startsWith('HTTP/1.1 200 '), `${label}: ${response.slice(0, 40)}`);
+      assert.match(head, new RegExp(`${CRLF}Content-Type: ${CONTENT_TYPE}${CRLF}`), `${label} content type`);
+      assert.match(head, new RegExp(`${CRLF}Cache-Control: ${CACHE_CONTROL}${CRLF}`), `${label} cache directive`);
       assert.strictEqual(
-        round.segments,
-        1,
-        `round ${index + 1} arrived in ${round.segments} segments; a body that trails the headers is what stalls`,
+        Buffer.byteLength(body, 'latin1'),
+        Number(/content-length:\s*(\d+)/i.exec(head)[1]),
+        `${label} delivered exactly the Content-Length it declared`,
       );
-      assert.ok(round.first.startsWith('HTTP/1.1 200 '), round.first.slice(0, 40));
-      assert.ok(round.first.endsWith('}'), 'the single segment must end with the complete body');
-      assertContractPayload(
-        JSON.parse(round.first.slice(round.first.indexOf(HEAD_BODY_SEPARATOR) + HEAD_BODY_SEPARATOR.length)),
-        `keep-alive round ${index + 1}`,
-      );
-      total += round.elapsedMs;
+
+      const payload = JSON.parse(body);
+      assertContractPayload(payload, label);
+      timestamps.add(payload.timestamp);
     }
 
-    assert.ok(
-      total < KEEP_ALIVE_BUDGET_MS,
-      `${KEEP_ALIVE_ROUNDS} keep-alive rounds took ${total.toFixed(1)} ms; the stall this guards against costs ~41 ms each`,
+    // A payload captured once at start-up, or a response cached at the head of the
+    // exchange, would satisfy every assertion above and still be stale.
+    assert.strictEqual(
+      timestamps.size,
+      KEEP_ALIVE_ROUNDS,
+      'each response on the reused connection must carry its own timestamp, never a replayed one',
     );
   });
 
   test('a request target the runtime cannot parse is refused, and the listener survives it', async () => {
-    // The second documented runtime boundary at this tier, and the mirror image of
-    // the Java tier's: Node's parser rejects a target carrying a scheme, so these
-    // four never reach the handler and the `400` below is the runtime's. The
-    // assertions are therefore the two properties that hold at every tier — the
-    // endpoint is not served through the spelling and no answer carries the payload
-    // — plus the one that makes the boundary harmless: the listener is still
-    // serving the real resource immediately afterwards, so a caller cannot use an
-    // unparsable target to take the endpoint down.
+    // Node's parser rejects a target carrying a scheme, so these never reach the
+    // handler and the refusal below is the runtime's. What is asserted is therefore
+    // what holds at every tier — the endpoint is not served through the spelling, no
+    // answer carries the payload — plus the property that makes the boundary
+    // harmless: the listener is still serving immediately afterwards, so an
+    // unparsable target cannot be used to take the endpoint down.
     for (const target of RUNTIME_REFUSED_TARGETS) {
       const response = await rawRequest(boundPort, 'GET', target);
 
@@ -3756,12 +3735,43 @@ describe('health.js — defensive request paths that a client cannot provoke', (
     assert.strictEqual(recorded.destroyed, true, 'the connection must not be left hanging');
   });
 
+  test('the health response is emitted as one logical write, not a head then a body', () => {
+    // The deterministic half of the contract's single-write clause
+    // (`docs/health-endpoint.md` §9.5), and the reason the keep-alive test on the wire
+    // does not need to count TCP segments. The defect this rules out was measured at
+    // the sibling Python tier: the head went out in one write and the body in a
+    // second, and on an unbuffered socket with Nagle's algorithm enabled the second
+    // write waited on the peer's delayed acknowledgement — ~41 ms per keep-alive
+    // request instead of ~0.1 ms, with nothing wrong in the response itself.
+    //
+    // Asserted at the handler, where it is a fact about the code rather than a
+    // measurement of the transport: exactly one `writeHead`, exactly one `end`, the
+    // whole body carried by that `end`, and not a single intermediate `write`.
+    const { res, recorded } = createResponseDouble();
+
+    health.handleRequest({ method: 'GET', url: HEALTH_PATH }, res);
+
+    assert.strictEqual(recorded.writeHeadCalls, 1, 'the head must be written exactly once');
+    assert.strictEqual(recorded.endCalls, 1, 'the response must be ended exactly once');
+    assert.deepStrictEqual(recorded.writes, [], 'the body must not be written separately from the end');
+    assert.strictEqual(recorded.statusCode, 200);
+
+    const body = recorded.body.toString('utf8');
+    assert.strictEqual(
+      recorded.headers['Content-Length'],
+      Buffer.byteLength(body, 'utf8'),
+      'the single write declares exactly the length it carries',
+    );
+    assertContractPayload(JSON.parse(body), 'the one-write health response');
+  });
+
   test('a socket-level handler writes one complete response, in a single write', () => {
     // The three socket-level listeners are handed a bare socket rather than a
     // `ServerResponse`, so they assemble the status line and the headers themselves.
-    // One write is asserted, not merely implied: two writes on an unbuffered socket
-    // are two segments, which is the shape that made the sibling tier's keep-alive
-    // responses wait on a delayed ACK.
+    // The assertion is that the whole response — status line, headers and body — is
+    // handed to the socket in one `end` call rather than assembled across several,
+    // which is a property of this module's write path and observable on a double.
+    // It says nothing about how the transport then frames those bytes.
     const { socket, recorded } = createSocketDouble();
 
     health.handleConnect({ method: 'CONNECT', url: `${LOOPBACK}:3000` }, socket);

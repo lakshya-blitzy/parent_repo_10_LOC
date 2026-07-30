@@ -215,13 +215,10 @@ const STATUS_METHOD_NOT_ALLOWED = 405;
 const NOT_FOUND_BODY = JSON.stringify({ error: 'Not Found' });
 const METHOD_NOT_ALLOWED_BODY = JSON.stringify({ error: 'Method Not Allowed' });
 
-// The protocol-level status codes. These are NOT contract codes: they answer
-// requests the HTTP parser refuses before routing is possible at all, which is a
-// different population from the routed responses above. They exist here so that
-// such a refusal still leaves a machine-readable answer on the wire instead of a
-// bodyless status line or, worse, silence — see {@link handleClientError}. Level 2
-// shapes the same population identically through `error_message_format`, so the
-// three tiers agree on protocol errors as well as on routed ones.
+// Protocol-level status codes, NOT contract codes: they answer requests the HTTP
+// parser refuses before routing is possible, so that a refusal still leaves a
+// machine-readable answer on the wire rather than a bodyless status line — see
+// {@link handleClientError}.
 const STATUS_BAD_REQUEST = 400;
 const STATUS_REQUEST_TIMEOUT = 408;
 const STATUS_HEADERS_TOO_LARGE = 431;
@@ -229,12 +226,10 @@ const STATUS_HEADERS_TOO_LARGE = 431;
 /**
  * Characters RFC 9110 §5.6.2 permits in a `token`, and therefore in a method name.
  *
- * This is the discriminator between the two populations of request line the HTTP
- * parser refuses with the same error code: a well-formed but unrecognised *method*
- * (`FROBNICATE`, lowercase `get`) — which the contract answers `405` — and a
- * genuinely malformed *request line* (a tab where the single space belongs) —
- * which is a `400`. Without it both would collapse onto one answer, and one of the
- * two would be wrong.
+ * The discriminator between the two populations the parser refuses under one error
+ * code: a well-formed but unrecognised *method* (`FROBNICATE`, lowercase `get`),
+ * answered `405`, and a malformed *request line* (a tab where the space belongs),
+ * answered `400`.
  *
  * @type {RegExp}
  */
@@ -244,11 +239,8 @@ const METHOD_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 const REQUEST_LINE_DELIMITER = ' ';
 
 /**
- * Upper bound on how much of a refused request line is inspected.
- *
- * A method token longer than this is not a method token, and reading further into
- * a hostile packet buys nothing. Bounded on purpose: the value inspected here came
- * off the wire from an unauthenticated peer.
+ * Upper bound on how much of a refused request line is inspected. Bounded because
+ * an unauthenticated peer chose the content.
  *
  * @type {number}
  */
@@ -1317,20 +1309,19 @@ function finalizeAfterUnexpectedError(res, error) {
 /**
  * Applies the contract's routing rule and returns the response to be written.
  *
- * The single source of the routing decision at this tier. It is a **pure**
- * function of the method and the raw request target — it reads the clock and the
- * already-resolved configuration, and touches nothing else — which is what lets
- * the same rule serve both response paths this module has:
+ * The single source of the routing decision at this tier, shared by both response
+ * paths this module has: {@link handleRequest}, which writes through a
+ * `ServerResponse`, and the socket-level {@link handleConnect} /
+ * {@link handleUpgrade}, which are handed a bare socket and write through
+ * {@link writeRawResponse}. Duplicating the method-then-path decision in the
+ * socket-level handlers is how a second, undocumented routing behaviour would
+ * appear on the same port.
  *
- *   - {@link handleRequest}, the ordinary `node:http` request listener, which
- *     writes the outcome through a `ServerResponse`; and
- *   - the socket-level listeners {@link handleConnect} and {@link handleUpgrade},
- *     which are handed a bare socket by the runtime and write the same outcome
- *     through {@link writeRawResponse}.
- *
- * Two paths, one rule, deliberately: duplicating the method-then-path decision in
- * the socket-level handlers is precisely how a second, undocumented routing
- * behaviour would appear on the same port.
+ * The **routing decision** is deterministic in the method and the raw request
+ * target alone. The **payload is not**: the success path builds a fresh one, which
+ * reads the clock, so this function is not pure and repeated calls with identical
+ * arguments differ in `timestamp`. It touches nothing else — no I/O beyond the
+ * already-resolved configuration.
  *
  * Routing order is normative, not incidental:
  *
@@ -1413,7 +1404,7 @@ function handleRequest(req, res) {
 }
 
 /**
- * Writes one complete response directly onto a socket, in a single write.
+ * Writes one complete response directly onto a socket.
  *
  * The socket-level counterpart of {@link writeJsonResponse}, and it exists because
  * `node:http` hands three of its events a **bare socket** rather than a
@@ -1424,8 +1415,10 @@ function handleRequest(req, res) {
  *
  * Three properties are deliberate:
  *
- *   - **One write.** The status line, the header block and the body are
- *     concatenated and written once, so the response leaves in a single segment.
+ *   - **One `socket.end` call.** The status line, the header block and the body are
+ *     concatenated and handed over together, which saves a round trip. How the
+ *     transport then frames those bytes is its own business, and the contract says
+ *     nothing about it (`docs/health-endpoint.md` §9.5).
  *   - **`Connection: close`.** Every request that reaches this function was
  *     refused at or below the protocol layer, so the connection's framing can no
  *     longer be trusted for reuse. Closing is the only safe framing, and it is
@@ -1515,22 +1508,14 @@ function destroySocket(socket) {
 /**
  * Answers a `CONNECT` request with the contract's `405`.
  *
- * `CONNECT` never reaches a request listener. `node:http` routes it to the
- * `'connect'` event, and a server with no listener for that event **destroys the
- * socket without writing anything at all** — the client gets silence, waits for its
- * own timeout, and learns nothing. That silence was the observed defect this
- * handler removes.
+ * `CONNECT` never reaches a request listener: `node:http` routes it to the
+ * `'connect'` event, and a server with no listener there **destroys the socket
+ * without writing anything at all**, so the client waits out its own timeout and
+ * learns nothing. Removing that silence is why this handler exists.
  *
- * `405` is the correct answer rather than an approximation: `CONNECT` is a
- * perfectly well-formed method token, it is simply not one of the two the contract
- * permits, and the contract says every other method is answered `405` with
- * `Allow: GET, HEAD`. It is also what the Level 2 and Level 3 siblings already
- * answer for the same request, so this restores the cross-tier uniformity the
- * contract exists to guarantee.
- *
- * The path is deliberately not consulted. A `CONNECT` target is authority-form (or
- * anything else a caller writes), and the contract evaluates the method before the
- * path, so the answer cannot depend on it.
+ * `405` is the contract's answer for every method other than `GET` and `HEAD`, and
+ * `CONNECT` is a well-formed method token that simply is not one of them. The path
+ * is not consulted, because the contract evaluates the method first.
  *
  * @param {import('node:http').IncomingMessage} _req The tunnel request. Unused: the
  *   method alone decides the answer.
@@ -1547,19 +1532,15 @@ function handleConnect(_req, socket) {
 /**
  * Answers a protocol upgrade request as the ordinary request it also is.
  *
- * A request carrying `Upgrade:` with `Connection: Upgrade` is routed by
- * `node:http` to the `'upgrade'` event, and — exactly as with `'connect'` — a
- * server with no listener destroys the socket unanswered. The same silence, from
- * the same cause.
+ * `Upgrade:` with `Connection: Upgrade` is routed to the `'upgrade'` event, which
+ * with no listener destroys the socket unanswered — the same silence as
+ * {@link handleConnect}, from the same cause.
  *
- * The answer here is the one the contract already prescribes for the request
- * underneath the upgrade offer: this server supports no upgrade protocol, so it
- * declines to switch and answers the request as sent. `GET /health` with an
- * `Upgrade` header is therefore a normal `200`, which is what the Level 2 and
- * Level 3 siblings answer for the same bytes — they have no notion of an upgrade
- * at all. `101 Switching Protocols` is never sent, and no other status is
- * invented: {@link resolveContractResponse} decides, so the upgrade path cannot
- * develop a routing rule of its own.
+ * This server speaks no upgrade protocol, so it declines to switch and answers the
+ * request as sent: `GET /health` with an `Upgrade` header is a normal `200`.
+ * `101 Switching Protocols` is never sent, and no status is invented here —
+ * {@link resolveContractResponse} decides, so this path cannot develop a routing
+ * rule of its own.
  *
  * @param {import('node:http').IncomingMessage} req The request that offered the upgrade.
  * @param {import('node:net').Socket} socket The socket the runtime detached.
@@ -1571,11 +1552,9 @@ function handleUpgrade(req, socket) {
 /**
  * Reads the method token out of a request line the parser refused.
  *
- * `error.rawPacket` carries the bytes as they arrived, which is the only place the
- * refused method survives — the parser rejected the line, so no `IncomingMessage`
- * was ever built. The token is everything before the first character RFC 9110
- * §5.6.2 does not permit in one, and it is read within a bound because an
- * unauthenticated peer chose the content.
+ * `error.rawPacket` is the only place the refused method survives: the parser
+ * rejected the line, so no `IncomingMessage` was ever built. Read within a bound
+ * because an unauthenticated peer chose the content.
  *
  * @param {Buffer|undefined} rawPacket The bytes of the refused request, if the
  *   runtime supplied them.
@@ -1604,39 +1583,27 @@ function refusedMethodToken(rawPacket) {
  * Answers a request the HTTP parser refused, so that a refusal is never silent.
  *
  * `node:http` emits `'clientError'` for a request its parser could not accept, and
- * its own default answer is a **bodyless** `HTTP/1.1 400 Bad Request` — no
- * `Content-Type`, no `Allow`, nothing a JSON consumer can read. For one population
- * of refused request that default is also the *wrong status*, which is the defect
- * this handler fixes.
+ * its default answer is a **bodyless** `HTTP/1.1 400 Bad Request` — nothing a JSON
+ * consumer can read, and for one population also the wrong status.
  *
- * The refusals are separated by cause, because they are genuinely different
- * conditions and the correct answer differs:
+ * The refusals are separated by cause, because the correct answer differs:
  *
- *   - **A well-formed but unrecognised method token** (`FROBNICATE`, or a
- *     lowercase `get`, which the parser's table does not contain) is answered with
- *     the contract's `405` and `Allow: GET, HEAD`. The contract says every method
- *     other than `GET` and `HEAD` is answered `405`, and it draws no distinction
- *     between a method the parser happens to know and one it does not — the Level 2
- *     and Level 3 siblings answer `405` for both, so answering `400` here was the
- *     one place the three tiers disagreed on a case the contract covers.
- *   - **A malformed request line** — anything else the parser rejected, including a
- *     tab where RFC 9112 §3 requires a single space — is a `400`. The method token
- *     is not the problem there, and claiming "method not allowed" about a line that
- *     could not be parsed would misdirect whoever reads it.
- *     {@link refusedMethodToken} is what tells the two apart.
- *   - **An oversized header block** is a `431`, and **a request that never
- *     completed within the runtime's timeout** is a `408`. Both are the RFC-correct
- *     answers for their condition, and both preserve the status `node:http` itself
- *     would have sent, so attaching this handler changes the code for exactly one
- *     population and no others.
+ *   - **A well-formed but unrecognised method token** (`FROBNICATE`, or a lowercase
+ *     `get`, which the parser's table does not contain) is the contract's `405`
+ *     with `Allow: GET, HEAD`. The contract draws no distinction between a method
+ *     the parser knows and one it does not.
+ *   - **A malformed request line** — anything else rejected, including a tab where
+ *     RFC 9112 §3 requires a space — is a `400`: the method token is not the
+ *     problem, so claiming "method not allowed" would misdirect the reader.
+ *     {@link refusedMethodToken} tells the two apart.
+ *   - **An oversized header block** is a `431` and **an incomplete request** a
+ *     `408`. Both preserve the status `node:http` itself would have sent, so
+ *     attaching this handler changes the code for exactly one population.
  *
- * Every answer carries the contract's own headers and a single-member JSON body
- * built from the runtime's reason phrase, which is the same shape Level 2 gives
- * the same population through its `error_message_format`.
- *
- * A refusal is never reported to the log. These requests arrive unauthenticated
- * and unsolicited, so a line per refusal would hand any peer a way to fill the log
- * of a process whose silence is a requirement.
+ * Every answer carries the contract's headers and a single-member JSON body built
+ * from the runtime's reason phrase. A refusal is never logged: these requests
+ * arrive unauthenticated, so a line per refusal would hand any peer a way to fill
+ * the log of a process whose silence is a requirement.
  *
  * @param {NodeJS.ErrnoException & {rawPacket?: Buffer}} error The parser's error.
  * @param {import('node:net').Socket} socket The socket the request arrived on.
@@ -1674,23 +1641,19 @@ function handleClientError(error, socket) {
  *
  * Binding is `server.js`'s responsibility, along with the process lifecycle, the
  * start-up log line and the signal handlers. Keeping `listen` out of this module
- * is what lets the unit suite require it, assert the contract and exit
- * immediately without ever opening a socket.
+ * lets the unit suite require it, assert the contract and exit without ever opening
+ * a socket.
  *
- * Four listeners, not one, and the three beyond the request listener are what stop
- * a request from being answered with silence. `node:http` routes `CONNECT` to
- * `'connect'`, an upgrade offer to `'upgrade'`, and a request its parser refused to
- * `'clientError'`; with no listener attached, the first two are **destroyed
- * unanswered** and the third gets a bodyless status line the contract does not
- * describe. Every listener is attached here rather than in `server.js` so that the
- * suite — which builds its servers through this factory — exercises the same
- * wiring the entry point runs, and so that the shape of a response stays the
- * responsibility of the module that owns the contract.
+ * Four listeners, not one: the three beyond the request listener are what stop a
+ * request from being answered with silence. With no listener attached, `CONNECT`
+ * and an upgrade offer are **destroyed unanswered** and a parser refusal gets a
+ * bodyless status line the contract does not describe. All four are attached here
+ * rather than in `server.js` so the suite exercises the same wiring the entry point
+ * runs, and so response shape stays with the module that owns the contract.
  *
- * `'checkContinue'` is deliberately **not** handled: with no listener, `node:http`
- * itself answers `100 Continue` and then emits the request normally, so an
- * `Expect: 100-continue` request already reaches {@link handleRequest} and is
- * already answered. There is no silence to remove there.
+ * `'checkContinue'` is deliberately not handled: with no listener `node:http`
+ * answers `100 Continue` itself and then emits the request normally, so an
+ * `Expect: 100-continue` request already reaches {@link handleRequest}.
  */
 function createHealthServer() {
   const server = http.createServer(handleRequest);
@@ -1712,47 +1675,30 @@ function createHealthServer() {
  * conventions a consumer may reasonably expect. Every one of those is the same
  * already-resolved value — there is no second resolution and no drift.
  *
- * `configSources` reports which link of each chain supplied each resolved value,
- * which is what makes the declared-source-to-runtime mapping assertable. For
- * `path` and `status` it is the only way to tell an adopted declaration (`file`)
- * from an absent or rejected one (`fallback`), because the only legal declaration
- * for either is by definition equal to the fallback.
- *
- * `STATUS_UP` is the contract's literal for the status member, exported so a
- * consumer can compare the resolved `config.status` against the contract rather
- * than against a string it retyped. `declaredStatus` reports what a document
- * declares *before* validation, so a caller can distinguish "declared and adopted"
- * from "declared and refused".
+ * `configSources` reports which link of each chain supplied each resolved value.
+ * For `path` and `status` it is the only way to tell an adopted declaration
+ * (`file`) from an absent or rejected one (`fallback`), because the only legal
+ * declaration for either is by definition equal to the fallback. `STATUS_UP` is the
+ * contract's status literal, exported so a consumer compares against the contract
+ * rather than a retyped string, and `declaredStatus` reports what a document
+ * declares *before* validation.
  *
  * The diagnostics surface — `configDegradations`,
- * `describeConfigurationDegradation` and `reportedHandlerFailures` — exists so
- * that the two conditions this module survives silently by design are
- * nevertheless *observable*: a configuration source that failed to supply its
- * values, and a genuinely unexpected handler failure. Both are recorded here and
- * rendered elsewhere, which is what keeps module load byte-silent while still
- * leaving an operator something to act on.
+ * `describeConfigurationDegradation`, `reportedHandlerFailures` and
+ * `frozenValueConflicts` — makes the two conditions this module survives silently
+ * by design *observable*: a configuration source that failed to supply its values,
+ * and an unexpected handler failure. They are recorded here and rendered by
+ * `server.js`, which keeps module load byte-silent while still leaving an operator
+ * something to act on.
  *
- * `requestTargetPath` is exported so that the unit suite can assert the routing
- * decision directly, spelling by spelling, without binding a socket, and
- * `resolveContractResponse` is exported for the same reason one level up: it is the
- * whole routing rule — method, then path, then payload — as a pure function, so the
- * decision both response paths share is assertable without a socket either.
- *
- * `handleConnect`, `handleUpgrade` and `handleClientError` are the three
- * socket-level listeners `createHealthServer` attaches, exported so the suite can
- * assert directly that each writes the frozen response and that none of them can
- * throw. Every one of the three answers a request that `node:http` would otherwise
- * leave unanswered or answer with a bodyless status line, so each needs to be
- * assertable on its own rather than only through a live socket.
- *
- * `currentTimestamp` and `formatTimestamp` are exported so the freshness clause can
- * be asserted directly: the first proves that two immediate calls differ, and the
- * second renders a chosen instant so the whole-second case is deterministic.
- *
- * `frozenValueConflicts` is the audit trail for the two values a deployment may
- * declare but not redefine: empty in a correctly configured deployment, and one
- * descriptor per rejected declaration otherwise. `server.js` turns it into
- * start-up warnings.
+ * `requestTargetPath` and `resolveContractResponse` are exported so the suite can
+ * assert the routing decision — spelling by spelling, then method-then-path-then-
+ * payload — without binding a socket. `handleConnect`, `handleUpgrade` and
+ * `handleClientError` are exported for the same reason: each answers a request
+ * `node:http` would otherwise leave unanswered, so each needs asserting on its own.
+ * `currentTimestamp` and `formatTimestamp` are exported so freshness is assertable
+ * directly, the second rendering a chosen instant to make the whole-second case
+ * deterministic.
  */
 module.exports = {
   buildHealthPayload,

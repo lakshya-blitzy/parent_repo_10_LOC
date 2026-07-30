@@ -1,116 +1,63 @@
-# .dockerignore - Docker build-context denylist for the apex (Level 1)
-# JavaScript health-endpoint tier, which serves /health on port 3000.
+# Build-context denylist for the apex (Level 1) JavaScript tier.
 #
-# The sibling Dockerfile is single-stage: it starts from node:24-alpine, copies
-# this tier's sources into /app, declares EXPOSE 3000 and a HEALTHCHECK that
-# probes /health, and runs `node server.js`. Only what that image genuinely
-# needs at run time may travel into the context. Everything listed below is
-# either local machine state, a build-time-only definition, or an artifact with
-# no purpose inside a running container.
+# The sibling Dockerfile copies its runtime files BY NAME, so this file does not
+# decide what lands in the image -- it decides what the daemon has to receive
+# before the build starts. Excluding .git alone is the difference between a
+# context measured in megabytes and one measured in kilobytes.
 #
-# Two properties make a small context worth the effort. Excluding the
-# repository history is the single highest-value entry here: .git is measured in
-# megabytes against a tracked source tree measured in kilobytes, so it dominates
-# the upload the daemon receives before the first instruction even runs. And a
-# context that carries no local-only state is a context that produces the same
-# image from the same commit on any machine, which is what makes the build
-# reproducible rather than merely repeatable.
+# Keep this an explicit denylist. A catch-all "*" with "!" re-inclusions is
+# harder to reason about, and one mis-ordered negation drops a file silently.
+# An unanchored pattern matches at the context root only, which is enough here:
+# every source file sits at the root and every excluded subtree is excluded as a
+# whole directory.
 #
-# This is an EXPLICIT DENYLIST by design. Do not rewrite it as a catch-all "*"
-# followed by "!" re-inclusions: negation ordering is subtle, and one
-# mis-ordered line silently drops a file the image cannot run without.
-#
-# Pattern semantics, so no line here is misread as a shell glob: "*" does not
-# cross a "/", so an unanchored pattern matches at the context root only. That
-# is sufficient at this tier because the composition is flat - every source file
-# sits at the root, and every excluded subtree below is excluded as a whole
-# directory, which takes its entire contents with it. There are deliberately no
-# "**" patterns and no negations in this file.
-#
-# -----------------------------------------------------------------------------
-# NEVER ADD THESE. The first two break the build loudly. The last two break
-# nothing loudly, which is exactly what makes them the dangerous ones:
-#
-#   server.js           The entry point. This is the image's CMD; without it the
-#                       container has nothing to run.
-#   health.js           The payload builder, request handler and server factory.
-#                       server.js requires it directly.
-#   package.json        Supplies the DECLARED name and version - the first two
-#                       members of the /health response body. health.js reads it
-#                       from disk at module load, anchored to __dirname.
-#   config/health.json  Supplies the DECLARED host, port and path. health.js
-#                       reads it the same way.
-#
-#   Why the last two are the dangerous ones: their absence does not raise. The
-#   CommonJS loader tolerates a MISSING package.json completely (only a
-#   MALFORMED one breaks require), so health.js loads, falls through to its
-#   compiled-in literal fallbacks, and still answers 200 with a valid four-key
-#   body. The HEALTHCHECK goes green and CI passes while the identity is no
-#   longer actually declared by this repository. Nothing fails, so only a direct
-#   existence check inside the image, or an assertion on the payload's name and
-#   version, can catch it.
-#
-#   So: never write a broad pattern such as *.json, config, or config/* - any of
-#   those would capture one or both of them. Note that the "*.test.js" line
-#   below is safe for the same class of reason inverted: it cannot match
-#   index.js, health.js or server.js, because none of those ends in ".test.js".
-#
-#   index.js is also copied. Nothing at run time requires it, but keeping it
-#   makes the image's /app match the repository, and it costs a few bytes.
-# -----------------------------------------------------------------------------
+# Never exclude package.json or config/health.json. health.js reads both at
+# module load and falls back to compiled-in literals rather than failing, so
+# their absence would leave the endpoint answering 200 with an identity this
+# repository never declared -- a failure with no symptom. So no broad *.json,
+# config or config/* pattern. ("*.test.js" below is safe: none of index.js,
+# health.js or server.js ends in ".test.js".)
 
-# Version-control metadata, its rules file, and its submodule declaration. None
-# is needed at run time, and .git additionally carries local remote-tracking
-# configuration that must never be baked into an image layer.
+# Version-control metadata, its rules file and its submodule declaration. .git
+# also carries local remote-tracking configuration that must not enter a layer.
 .git
 .gitignore
 .gitmodules
 
-# The child submodule's working tree. Each tier of this composition builds its
-# OWN image from its OWN sources: Levels 2 and 3 have their own Dockerfiles and
-# serve ports 8000 and 8080. Copying this directory in would bloat a Node image
-# with Python and Java sources it can neither run nor serve.
-#
-# This is a BUILD-CONTEXT exclusion and nothing more. It has no bearing on
-# version control, where the submodule remains fully tracked and first-class -
-# .dockerignore is read only by the Docker daemon and is invisible to Git.
+# The child submodule's working tree. Each tier builds its own image from its
+# own sources, so a Node image has no use for Python and Java trees. This is a
+# build-context exclusion only; the submodule stays fully tracked in Git.
 child_repo_10_LOC
 
-# Build-time-only container definitions. The daemon reads these from the context
-# before the build begins; a running container has no use for either.
+# Build-time-only container definitions: read from the context before the build,
+# useless inside a running container.
 .dockerignore
 Dockerfile
 
-# Continuous-integration definitions. Consumed by the CI service straight from
-# the repository, never from inside the image.
+# A .github directory, whenever one is added. Anything under it is read from the
+# repository rather than from inside an image, so it never belongs in a context.
 .github
 
 # Local environment files. A secrets file must never enter an image layer, and
-# nothing here parses one at run time in any case: this tier reads process.env
-# directly, because the composition carries zero third-party dependencies and so
-# has no dotenv loader. The pattern intentionally also covers the tracked
-# .env.example, which is documentation rather than runtime input.
+# nothing here parses one anyway: this tier reads process.env directly. The
+# pattern also covers the tracked .env.example, which is documentation.
 .env*
 
-# Installed dependency tree. This tier has none - every module it loads is a
-# Node built-in - so this directory should never exist. The line is defensive:
-# it stops a stale host node_modules from being copied in and shadowing that
-# zero-dependency guarantee.
+# Installed dependency tree. This tier has none -- every module it loads is a
+# Node built-in -- so this line exists to keep a stale host directory out of the
+# context, not to protect the image: the Dockerfile copies named files only, so
+# node_modules could not reach /app in any case.
 node_modules
 
-# Test sources. Currently index.test.js, exercised by `node --test` in CI and
-# during development. A runtime image ships no test.
+# Test sources. A runtime image ships no test.
 *.test.js
 
-# Documentation, including this tier's normative contract document. Both are
-# read from the repository; health.js and server.js reference
-# docs/health-endpoint.md only in comments and never open it at run time.
+# Documentation, including the normative contract document. health.js and
+# server.js reference docs/health-endpoint.md in comments and never open it.
 docs
 README.md
 
-# Execution residue from a local run of the test suite or of npm. None of it is
-# reproducible input, and a coverage report or a debug log has no meaning inside
-# an image.
+# Execution residue from a local test or npm run. Not reproducible input.
 coverage
 .npm
 npm-debug.log*
@@ -120,11 +67,8 @@ npm-debug.log*
 .DS_Store
 Thumbs.db
 
-# Note on what is deliberately NOT excluded: .nvmrc stays in the context. It
-# pins the Node version for contributors and for the workflow's
-# node-version-file input, and the image's own Node version comes from the
-# node:24-alpine base tag instead, so it is unused at run time - but it is eight
-# bytes, it keeps /app consistent with the repository, and leaving it costs
-# nothing. Python and Java residue patterns (__pycache__, *.pyc, *.class) are
-# likewise absent on purpose: this tier cannot produce them, and Levels 2 and 3
-# each exclude their own in their own .dockerignore.
+# Deliberately NOT excluded: .nvmrc. It pins the Node version for contributors
+# and is unused at run time -- the image's Node comes from the base tag -- but it
+# is eight bytes and keeps /app consistent with the repository. Python and Java
+# residue patterns are absent because this tier cannot produce them; Levels 2
+# and 3 exclude their own.
