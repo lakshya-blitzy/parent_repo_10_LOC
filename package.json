@@ -1,0 +1,14 @@
+{
+  "name": "parent_repo_10_LOC",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Apex JavaScript application of the parent/child/nested repository composition; exposes a read-only GET /health endpoint reporting name, version, timestamp and status.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js --serve",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
