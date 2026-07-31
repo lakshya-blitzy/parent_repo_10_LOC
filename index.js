@@ -5,10 +5,8 @@ const HEALTH_PATH = '/health';
 // The sibling Python and Java implementations emit the identical `Allow` value, so
 // the exact `, ` spacing is part of the contract rather than incidental formatting.
 const ALLOWED_METHODS = 'GET, HEAD';
-/**
- * Loopback by default, so the listener stays off external interfaces unless an
- * operator opts in by setting `HOST`.
- */
+// Loopback by default, so the listener stays off external interfaces unless an
+// operator opts in by setting HOST.
 const DEFAULT_HOST = '127.0.0.1';
 const DEFAULT_PORT = 3000;
 // Bounds the refusal classifier below: a longer request line is treated as
@@ -42,27 +40,26 @@ function healthPayload() {
   };
 }
 
-// Buffer.byteLength rather than the string length, so Content-Length counts bytes
-// rather than UTF-16 code units, and no-store because a cached liveness answer would
-// be worse than none. HEAD is deliberately not special-cased: Node suppresses the body
-// itself, so this one path yields the full GET header set with a zero-byte body.
+// Buffer.byteLength so Content-Length counts bytes rather than UTF-16 code units;
+// no-store because a cached liveness answer would be worse than none; close because
+// the endpoint reads no request body, and a connection reused while unread bytes remain
+// lets them be parsed as the next request. Node suppresses the body of a HEAD itself.
 function sendJson(res, status, body, extraHeaders) {
   const payload = JSON.stringify(body);
   const headers = {
     'Content-Type': 'application/json',
     'Content-Length': Buffer.byteLength(payload),
-    'Cache-Control': 'no-store'
+    'Cache-Control': 'no-store',
+    Connection: 'close'
   };
   Object.assign(headers, extraHeaders || {});
   res.writeHead(status, headers);
   res.end(payload);
 }
 
-// The single routing decision in the application: path first, method second. Every
-// inbound entry point below dispatches through here, so no request is answered by
-// logic that has not made the same two checks. Query and fragment are stripped, as
-// the sibling implementations strip them, so /health?probe=lb still matches. Both
-// error bodies are fixed literals, so neither the path nor the method is echoed back.
+// The single routing decision: path first, method second, and every inbound entry
+// point below dispatches through here. Query and fragment are stripped as the siblings
+// strip them; the error bodies are fixed literals that echo nothing of the request.
 function routeRequest(req, res) {
   const path = (req.url || '/').split('?')[0].split('#')[0];
   if (path !== HEALTH_PATH) {
@@ -82,21 +79,14 @@ function discardBody(req) {
   req.resume();
 }
 
-// Without a listener Node writes `100 Continue` itself and only then emits the
-// request, granting an upload before the route and the method have been looked at.
-// Routing first means the refusal is the fixed envelope and no upload is invited;
-// RFC 9110 allows that final response in place of the interim one.
-function handleContinue(req, res) {
+// Both `Expect` events land here, because the header changes nothing about what this
+// endpoint owes a caller: it reads no request body, so there is no expectation to meet.
+// Left to Node, `100-continue` would be answered with an interim response that invites
+// an upload before the route and the method have been looked at, and any other value
+// with a bare 417 the siblings never send. Routing instead sends one final response,
+// which RFC 9110 permits in place of the interim one.
+function handleExpect(req, res) {
   routeRequest(req, res);
-  discardBody(req);
-}
-
-// Node answers an `Expect` value it does not recognise with a bare 417 carrying no
-// media type, no Content-Length and no Cache-Control - the one response this
-// application would not have written. The status stays 417 because RFC 9110 defines
-// it for an expectation a server will not meet; only the envelope changes.
-function handleExpectation(req, res) {
-  sendJson(res, 417, { error: 'Expectation Failed' });
   discardBody(req);
 }
 
@@ -133,8 +123,7 @@ function isRequestTarget(value) {
 
 // A refused request never becomes a req/res pair, but its packet still carries the
 // request line the router would have used, so classifying it here keeps one contract
-// across both paths. Only an unrecognised method or an unacceptable target concern
-// that line; every other refusal leaves the request malformed, so it stays a 400.
+// across both paths. Any other refusal leaves the request malformed, so it stays a 400.
 function refusedRequestStatus(code, rawPacket) {
   if (code !== 'HPE_INVALID_METHOD' && code !== 'HPE_INVALID_URL') {
     return 400;
@@ -170,7 +159,8 @@ function refusedRequestStatus(code, rawPacket) {
 
 // The socket-level counterpart of sendJson, for a refusal that has no ServerResponse
 // to write through. The body comes from the status code alone, so nothing from the
-// request can reach it, and Connection: close because rejected framing cannot be reused.
+// request can reach it. Date is written by hand because nothing else does on this path,
+// and RFC 9110 requires it on a 4xx from a server that has a clock.
 function sendRawJson(socket, status) {
   const reason = http.STATUS_CODES[status];
   const payload = JSON.stringify({ error: reason });
@@ -178,7 +168,8 @@ function sendRawJson(socket, status) {
     `HTTP/1.1 ${status} ${reason}`,
     'Content-Type: application/json',
     `Content-Length: ${Buffer.byteLength(payload)}`,
-    'Cache-Control: no-store'
+    'Cache-Control: no-store',
+    `Date: ${new Date().toUTCString()}`
   ];
   if (status === 405) {
     head.push(`Allow: ${ALLOWED_METHODS}`);
@@ -188,8 +179,7 @@ function sendRawJson(socket, status) {
 }
 
 // A request Node's own parser refuses never reaches the router, because no request
-// object is created for it; the parser hands the refused packet here instead, so
-// classifying it keeps those answers inside the same contract.
+// object is created for it; the parser hands the refused packet here instead.
 function handleClientError(error, socket) {
   if (error.code === 'ECONNRESET' || !socket.writable) {
     return;
@@ -197,23 +187,20 @@ function handleClientError(error, socket) {
   sendRawJson(socket, refusedRequestStatus(error.code, error.rawPacket));
 }
 
-// Returned unbound so a caller can choose its address, which is what lets a test
-// suite listen on port 0 and take an ephemeral port. Every entry point Node offers
-// for an inbound request is wired to application code here - the request event, the
-// two `Expect` events and the parser's own refusals - so no answer this listener
-// produces is a framework default.
+// Returned unbound so a caller can choose its address, which is what lets a test suite
+// listen on port 0. Every entry point Node offers for an inbound request is wired to
+// application code here, so no answer this listener produces is a framework default.
 function createServer() {
   const server = http.createServer(routeRequest);
   server.on('clientError', handleClientError);
-  server.on('checkContinue', handleContinue);
-  server.on('checkExpectation', handleExpectation);
+  server.on('checkContinue', handleExpect);
+  server.on('checkExpectation', handleExpect);
   return server;
 }
 
 // An unset, blank, non-numeric or out-of-range PORT falls back to the default rather
 // than aborting start-up, while 0 is honoured as a request for an ephemeral port. The
-// signal handlers are installed here, not at module scope, so requiring this module
-// registers nothing.
+// signal handlers are installed here, not at module scope, so requiring registers none.
 function startServer() {
   const configuredHost = (process.env.HOST || '').trim();
   const host = configuredHost === '' ? DEFAULT_HOST : configuredHost;
@@ -228,10 +215,9 @@ function startServer() {
     : DEFAULT_PORT;
 
   const server = createServer();
-  // Left unhandled a bind failure becomes an unhandled EventEmitter error, and Node
-  // prints the configured host, its own version and a stack trace; this reduces it to
-  // one fixed sentence naming the variables to check without echoing either value.
-  // The exit status is set rather than forced so the diagnostic is flushed in full.
+  // Left unhandled a bind failure prints the configured host, Node's own version and a
+  // stack trace; this reduces it to one fixed sentence naming the variables to check
+  // without echoing either value. exitCode rather than exit() so the line is flushed.
   server.once('error', function () {
     const failure = 'could not bind the health endpoint; check HOST and PORT';
     console.error(`${pkg.name} ${pkg.version} ${failure}`);
@@ -246,8 +232,8 @@ function startServer() {
   });
 
   const shutdown = function () {
-    // Idle keep-alive sockets are released first: close() otherwise waits for
-    // them, and a probe that left a connection open would delay the exit.
+    // A connection with no request in flight is released first: close() would wait
+    // for it, so a caller that opened a socket and sent nothing would delay the exit.
     if (typeof server.closeIdleConnections === 'function') {
       server.closeIdleConnections();
     }
