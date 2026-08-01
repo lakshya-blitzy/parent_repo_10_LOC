@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const net = require('node:net');
-const { spawnSync } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const pkg = require('./package.json');
 const app = require('./index.js');
 
@@ -27,6 +27,7 @@ const EXPECTED_DEFAULT_PORT = 3000;
 
 const NOT_FOUND_BODY = '{"error":"Not Found"}';
 const METHOD_NOT_ALLOWED_BODY = '{"error":"Method Not Allowed"}';
+const BAD_REQUEST_BODY = '{"error":"Bad Request"}';
 
 // FOO exercises Node's parser-refusal path; the other verbs reach routing.
 const REJECTED_METHODS = ['POST', 'OPTIONS', 'DELETE', 'FOO'];
@@ -55,6 +56,20 @@ const EXCHANGE_TIMEOUT_MS = 5000;
 // Poll across a second boundary to verify a per-request timestamp.
 const FRESHNESS_TIMEOUT_MS = 5000;
 const FRESHNESS_POLL_MS = 100;
+
+// A listener run as a child process must announce its port, and must then end when it is
+// signalled, inside bounds the suite can fail on rather than hang on. The shutdown bound is
+// deliberately far larger than the grace window the program itself waits out, so a pass means
+// the process decided to end rather than that the assertion was generous.
+const SERVE_START_TIMEOUT_MS = 10000;
+const SHUTDOWN_TIMEOUT_MS = 5000;
+
+// Both signals a supervisor sends must end the process the same way.
+const SHUTDOWN_SIGNALS = ['SIGTERM', 'SIGINT'];
+
+// The startup banner is the only thing that tells a caller where a PORT=0 listener bound, so
+// its whole shape is matched: name, version, host, port and path are each captured and checked.
+const BANNER_PATTERN = /^(\S+) (\S+) health endpoint listening on http:\/\/([^:/]+):(\d+)(\/\S*)\n/;
 
 const HEAD_TERMINATOR = '\r\n\r\n';
 
@@ -101,13 +116,17 @@ async function withServer(exercise) {
   }
 }
 
-// Use a raw socket to count bytes after the HTTP head; clients suppress HEAD bodies.
-function rawExchange(address, requestLine) {
+// Write exact bytes on a raw socket and collect the answer to end of stream. Exact bytes,
+// because an HTTP client cannot express several of the inbound shapes this endpoint still owes
+// an answer to: a request line the parser refuses, a CONNECT, or a request carrying no Host
+// field at all. Reading to EOF also counts the bytes after the head, which is what proves a
+// HEAD response carries none.
+function rawSend(address, request, label) {
   return new Promise(function (resolve, reject) {
     const chunks = [];
     const socket = net.createConnection({ host: address.host, port: address.port });
     socket.setTimeout(EXCHANGE_TIMEOUT_MS, function () {
-      socket.destroy(new Error(`[${requestLine}] went unanswered for `
+      socket.destroy(new Error(`[${label}] went unanswered for `
         + `${EXCHANGE_TIMEOUT_MS} ms`));
     });
     socket.on('error', reject);
@@ -118,7 +137,7 @@ function rawExchange(address, requestLine) {
       const reply = Buffer.concat(chunks);
       const terminator = reply.indexOf(HEAD_TERMINATOR);
       if (terminator < 0) {
-        reject(new Error(`the reply to [${requestLine}] never terminated its head`));
+        reject(new Error(`the reply to [${label}] never terminated its head`));
         return;
       }
       resolve({
@@ -129,10 +148,17 @@ function rawExchange(address, requestLine) {
       });
     });
     socket.on('connect', function () {
-      socket.end(`${requestLine} HTTP/1.1\r\nHost: ${address.host}:${address.port}\r\n`
-        + 'Connection: close\r\n\r\n');
+      socket.end(request);
     });
   });
+}
+
+// The well-formed case: a request line completed with the fields a client would have added.
+function rawExchange(address, requestLine) {
+  return rawSend(address,
+    `${requestLine} HTTP/1.1\r\nHost: ${address.host}:${address.port}\r\n`
+      + 'Connection: close\r\n\r\n',
+    requestLine);
 }
 
 // HTTP field names are case-insensitive; normalize raw-header comparisons.
@@ -160,6 +186,124 @@ async function request(url, options) {
 function delay(ms) {
   return new Promise(function (resolve) {
     setTimeout(resolve, ms);
+  });
+}
+
+// Fail awaited work at a bound rather than let it hang the suite. The timer is cleared on
+// every outcome, so a settled race cannot keep the event loop alive after the test returns.
+function withDeadline(work, ms, message) {
+  return new Promise(function (resolve, reject) {
+    const timer = setTimeout(function () {
+      reject(new Error(message));
+    }, ms);
+    work.then(function (value) {
+      clearTimeout(timer);
+      resolve(value);
+    }, function (error) {
+      clearTimeout(timer);
+      reject(error);
+    });
+  });
+}
+
+// The listener as an operator runs it: a real child process, given PORT=0 so it cannot collide
+// with anything and must report the port it was actually assigned. Its banner is the only thing
+// that tells this test where to reach it, and `ready` resolves with the parsed banner.
+function startServeProcess() {
+  const started = {
+    child: spawn(process.execPath, [ENTRY_POINT, '--serve'], {
+      env: Object.assign({}, process.env, { PORT: '0', HOST: LOOPBACK_HOST }),
+      // Piped rather than inherited, so the banner lands in a buffer this test can parse
+      // instead of in the reporter's stream.
+      stdio: ['ignore', 'pipe', 'pipe']
+    }),
+    stdout: '',
+    stderr: ''
+  };
+  started.child.stdout.setEncoding('utf8');
+  started.child.stderr.setEncoding('utf8');
+  started.child.stderr.on('data', function (chunk) {
+    started.stderr += chunk;
+  });
+  started.ready = new Promise(function (resolve, reject) {
+    started.child.stdout.on('data', function (chunk) {
+      started.stdout += chunk;
+      const announced = BANNER_PATTERN.exec(started.stdout);
+      if (announced !== null) {
+        resolve(announced);
+      }
+    });
+    started.child.once('error', reject);
+    // Exiting before the banner means the bind failed, which is a start-up failure rather
+    // than a timeout, so it is reported as one along with everything the child wrote.
+    started.child.once('exit', function (code, signal) {
+      reject(new Error(`the listener exited (code ${code}, signal ${signal}) before it `
+        + `announced a port; stdout was ${JSON.stringify(started.stdout)} and stderr `
+        + `${JSON.stringify(started.stderr)}`));
+    });
+  });
+  return started;
+}
+
+function hasEnded(child) {
+  return child.exitCode !== null || child.signalCode !== null;
+}
+
+function exitOf(child) {
+  return new Promise(function (resolve) {
+    if (hasEnded(child)) {
+      resolve({ code: child.exitCode, signal: child.signalCode });
+      return;
+    }
+    child.once('exit', function (code, signal) {
+      resolve({ code, signal });
+    });
+  });
+}
+
+// A caller that connects and then sends nothing at all: what a load-balancer TCP probe and a
+// port scanner both do, and what a health endpoint attracts most of. The error handler is
+// permanent because the listener destroys this socket while shutting down, and the reset that
+// follows must not surface as an unhandled event.
+function connectSilently(address) {
+  return new Promise(function (resolve, reject) {
+    let connected = false;
+    const socket = net.createConnection({ host: address.host, port: address.port });
+    socket.on('error', function (error) {
+      if (!connected) {
+        reject(error);
+      }
+    });
+    socket.once('connect', function () {
+      connected = true;
+      resolve(socket);
+    });
+  });
+}
+
+// A refused connection is how a released port answers. Anything else - a completed connection,
+// or a connection that neither completes nor is refused - means the port is still held.
+function portIsReleased(port) {
+  return new Promise(function (resolve) {
+    let settled = false;
+    const socket = net.createConnection({ host: LOOPBACK_HOST, port });
+    const settle = function (released) {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      socket.destroy();
+      resolve(released);
+    };
+    socket.on('error', function () {
+      settle(true);
+    });
+    socket.setTimeout(EXCHANGE_TIMEOUT_MS, function () {
+      settle(false);
+    });
+    socket.on('connect', function () {
+      settle(false);
+    });
   });
 }
 
@@ -371,4 +515,183 @@ test('unsupported methods respond 405 and advertise the allowed methods',
       assert.ok(!body.includes('FOO'),
         `the refusal echoed the request method: ${body}`);
     });
+  });
+
+// Every inbound shape Node takes out of the normal request pipeline, paired with the answer the
+// contract owes it. A CONNECT is handed to a 'connect' listener and, with none, the socket is
+// closed unanswered; an HTTP/1.1 request with no Host is refused by Node itself, ahead of the
+// router, with a chunked bodiless 400; a request line the parser refuses is handed to
+// 'clientError'. None of them reaches routeRequest, and every one of them must still be answered
+// as JSON with the same three headers every routed answer carries. Status lines are written out
+// in full rather than composed, so the test states the wire bytes it expects.
+function bypassCases(address) {
+  const authority = `${address.host}:${address.port}`;
+  return [
+    {
+      name: 'CONNECT on the route',
+      request: `CONNECT ${HEALTH_PATH} HTTP/1.1\r\nHost: ${authority}\r\n\r\n`,
+      statusLine: 'HTTP/1.1 405 Method Not Allowed',
+      body: METHOD_NOT_ALLOWED_BODY,
+      allow: EXPECTED_ALLOW,
+      absent: ['CONNECT']
+    },
+    {
+      // The authority form RFC 9110 defines for CONNECT: a host and port, no path at all.
+      name: 'CONNECT in authority form',
+      request: `CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\n\r\n`,
+      statusLine: 'HTTP/1.1 404 Not Found',
+      body: NOT_FOUND_BODY,
+      allow: null,
+      absent: ['CONNECT', address.host]
+    },
+    {
+      name: 'HTTP/1.1 with no Host field',
+      request: `GET ${HEALTH_PATH} HTTP/1.1\r\n\r\n`,
+      statusLine: 'HTTP/1.1 400 Bad Request',
+      body: BAD_REQUEST_BODY,
+      allow: null,
+      absent: []
+    },
+    {
+      name: 'a method token split by a space',
+      request: `GE T ${HEALTH_PATH} HTTP/1.1\r\nHost: ${authority}\r\n\r\n`,
+      statusLine: 'HTTP/1.1 400 Bad Request',
+      body: BAD_REQUEST_BODY,
+      allow: null,
+      absent: ['GE T']
+    },
+    {
+      name: 'an empty request target',
+      request: `GET  HTTP/1.1\r\nHost: ${authority}\r\n\r\n`,
+      statusLine: 'HTTP/1.1 400 Bad Request',
+      body: BAD_REQUEST_BODY,
+      allow: null,
+      absent: []
+    }
+  ];
+}
+
+test('requests that never reach the router are still answered inside the JSON contract',
+  async function () {
+    await withServer(async function (address) {
+      for (const shape of bypassCases(address)) {
+        const context = shape.name;
+        const wire = await rawSend(address, shape.request, context);
+        const statusLine = wire.head.split('\r\n')[0];
+        const body = wire.body.toString('utf8');
+        const head = wire.head.toLowerCase();
+
+        // Silence is not one of this contract's answers, so the answer is checked before
+        // anything about it: an empty reply never terminates its head and rawSend would
+        // already have failed, and a wrong status is reported with the line that arrived.
+        assert.equal(statusLine, shape.statusLine, context);
+        assert.ok(head.includes(`content-type: ${EXPECTED_MEDIA_TYPE}`),
+          `${context}: not served as JSON: [${wire.head}]`);
+        assert.ok(!head.includes('text/html'),
+          `${context}: answered with markup: [${wire.head}]`);
+        assert.ok(head.includes(`cache-control: ${EXPECTED_CACHE_CONTROL}`),
+          `${context}: a liveness answer was left cacheable: [${wire.head}]`);
+        // RFC 9110 requires Date from a server that has a clock, and this path writes it
+        // by hand because no ServerResponse does it here.
+        assert.ok(head.includes('date: '), `${context}: no Date was sent: [${wire.head}]`);
+        // Nothing is read from the request, so the socket must not be offered for reuse
+        // with unread bytes still on it.
+        assert.ok(head.includes('connection: close'),
+          `${context}: the connection was offered for reuse: [${wire.head}]`);
+        const announced = /content-length: (\d+)/.exec(head);
+        assert.notEqual(announced, null,
+          `${context}: no length was announced: [${wire.head}]`);
+        assert.equal(wire.body.length, Number(announced[1]), context);
+        assert.equal(body, shape.body, context);
+        if (shape.allow === null) {
+          assert.ok(!head.includes('allow:'),
+            `${context}: advertised allowed methods on a non-405: [${wire.head}]`);
+        } else {
+          assert.ok(head.includes(`allow: ${shape.allow.toLowerCase()}`),
+            `${context}: did not advertise the allowed methods: [${wire.head}]`);
+        }
+        // No name, version, runtime or diagnostic beyond the status may be disclosed.
+        assert.ok(!head.includes('server:'),
+          `${context}: disclosed a Server field: [${wire.head}]`);
+        // The status line and the body are what the request could have been reflected
+        // into; the field names around them are the writer's own.
+        const answer = `${statusLine}\r\n${body}`;
+        for (const token of shape.absent) {
+          assert.ok(!answer.includes(token),
+            `${context}: the answer echoed [${token}]: ${answer}`);
+        }
+      }
+
+      // Host is mandatory only from HTTP/1.1 onward, so answering its absence must not turn a
+      // valid HTTP/1.0 request into a refusal.
+      const legacy = await rawSend(address, `GET ${HEALTH_PATH} HTTP/1.0\r\n\r\n`,
+        'HTTP/1.0 with no Host field');
+      assert.equal(legacy.head.split('\r\n')[0], 'HTTP/1.1 200 OK',
+        `an HTTP/1.0 request was refused: [${legacy.head}]`);
+      const document = JSON.parse(legacy.body.toString('utf8'));
+      assert.deepEqual(Object.keys(document), EXPECTED_KEYS);
+      assert.equal(document.status, EXPECTED_STATUS);
+      assert.equal(document.name, EXPECTED_NAME);
+    });
+  });
+
+test('a signal ends the listener promptly even while a caller holds a connection it '
+  + 'never used', async function () {
+    for (const signal of SHUTDOWN_SIGNALS) {
+      const context = `signal ${signal}`;
+      const started = startServeProcess();
+      const announced = await withDeadline(started.ready, SERVE_START_TIMEOUT_MS,
+        `${context}: the listener announced no port within ${SERVE_START_TIMEOUT_MS} ms`);
+      const boundPort = Number(announced[4]);
+      let silent = null;
+      try {
+        assert.equal(announced[1], pkg.name, context);
+        assert.equal(announced[2], pkg.version, context);
+        assert.equal(announced[3], LOOPBACK_HOST, context);
+        assert.equal(announced[5], HEALTH_PATH, context);
+        // PORT=0 was asked for, so the banner must name the port actually assigned rather
+        // than the one requested.
+        assert.ok(boundPort > 0, `${context}: the banner reported port ${announced[4]}`);
+
+        const probe = await request(`http://${LOOPBACK_HOST}:${boundPort}${HEALTH_PATH}`);
+        assert.equal(probe.response.status, 200,
+          `${context}: the listener never served the endpoint`);
+        assert.equal(JSON.parse(probe.text).status, EXPECTED_STATUS, context);
+
+        silent = await withDeadline(
+          connectSilently({ host: LOOPBACK_HOST, port: boundPort }),
+          EXCHANGE_TIMEOUT_MS,
+          `${context}: no connection could be opened to port ${boundPort}`);
+
+        const ended = exitOf(started.child);
+        started.child.kill(signal);
+        // A second signal arriving while the first is still being honoured must change
+        // nothing: no second close, no second grace window, no error on the way out.
+        started.child.kill(signal);
+        const outcome = await withDeadline(ended, SHUTDOWN_TIMEOUT_MS,
+          `${context}: the listener was still running ${SHUTDOWN_TIMEOUT_MS} ms after the `
+            + 'signal while a caller held a connection it had sent nothing on');
+
+        // Exit 0 with no signal code: the process must end because its handler closed the
+        // listener and returned, not because the signal killed it or a default handler did.
+        assert.equal(outcome.signal, null,
+          `${context}: the process was terminated by ${outcome.signal} instead of exiting`);
+        assert.equal(outcome.code, 0, `${context}: exited ${outcome.code}`);
+        assert.equal(started.stderr, '',
+          `${context}: wrote to stderr while shutting down: ${started.stderr}`);
+        // Exactly one banner line and nothing else: shutdown is silent.
+        assert.equal(started.stdout.split('\n').length - 1, 1,
+          `${context}: wrote more than the banner: ${JSON.stringify(started.stdout)}`);
+        assert.equal(await portIsReleased(boundPort), true,
+          `${context}: port ${boundPort} was still reachable after the process exited`);
+      } finally {
+        if (silent !== null) {
+          silent.destroy();
+        }
+        // Whatever the assertions found, no listener may outlive the test that started it.
+        if (!hasEnded(started.child)) {
+          started.child.kill('SIGKILL');
+        }
+      }
+    }
   });

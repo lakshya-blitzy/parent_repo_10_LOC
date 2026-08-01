@@ -17,6 +17,10 @@ const MAX_REQUEST_LINE_LENGTH = 8192;
 // should refuse politely from a request line that is simply not HTTP.
 const METHOD_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 const SUPPORTED_VERSION = /^HTTP\/1\.[01]$/;
+// How long a shutdown lets a response in flight finish before the sockets carrying it are
+// destroyed. Long enough that an answer already being written completes, short enough that a
+// supervisor's signal is honoured promptly rather than at the end of its grace period.
+const SHUTDOWN_GRACE_MS = 250;
 
 function add(a, b) {
   return a + b;
@@ -61,6 +65,16 @@ function sendJson(res, status, body, extraHeaders) {
 // point below dispatches through here. Query and fragment are stripped as the siblings
 // strip them; the error bodies are fixed literals that echo nothing of the request.
 function routeRequest(req, res) {
+  // RFC 9110 requires a 400 for an HTTP/1.1 request that carries no Host field. Node checks
+  // that itself, but its rejection answers with a chunked, bodiless 400 written before this
+  // function is reached - no Content-Type, no Content-Length, no Cache-Control and no JSON.
+  // The check is therefore made here, with Node's own one turned off at createServer, so this
+  // answer comes from the one writer every other answer comes from.
+  if (req.httpVersionMajor === 1 && req.httpVersionMinor === 1
+    && req.headers.host === undefined) {
+    sendJson(res, 400, { error: 'Bad Request' });
+    return;
+  }
   const path = (req.url || '/').split('?')[0].split('#')[0];
   if (path !== HEALTH_PATH) {
     sendJson(res, 404, { error: 'Not Found' });
@@ -187,14 +201,32 @@ function handleClientError(error, socket) {
   sendRawJson(socket, refusedRequestStatus(error.code, error.rawPacket));
 }
 
+// A CONNECT request is taken out of the normal request pipeline by Node, which hands it to a
+// 'connect' listener and, when there is none, closes the socket without answering at all. Silence
+// is not one of this contract's answers, so the request is routed here instead - with the same
+// path-then-method ordering, through the same socket-level writer a refused request uses. There is
+// no ServerResponse to write through on this path, and no body to serve either: CONNECT is never
+// GET or HEAD, so the route can only owe it a 405, and any other target a 404. (An Upgrade request
+// needs no counterpart: Node leaves those in the normal pipeline, where routeRequest answers them.)
+function handleConnect(req, socket) {
+  if (!socket || !socket.writable) {
+    return;
+  }
+  const path = (req.url || '').split('?')[0].split('#')[0];
+  sendRawJson(socket, path === HEALTH_PATH ? 405 : 404);
+}
+
 // Returned unbound so a caller can choose its address, which is what lets a test suite
 // listen on port 0. Every entry point Node offers for an inbound request is wired to
 // application code here, so no answer this listener produces is a framework default.
 function createServer() {
-  const server = http.createServer(routeRequest);
+  // requireHostHeader is turned off so that Node's own bodiless, chunked 400 cannot be written
+  // ahead of the router; routeRequest makes the same check and answers it through sendJson.
+  const server = http.createServer({ requireHostHeader: false }, routeRequest);
   server.on('clientError', handleClientError);
   server.on('checkContinue', handleExpect);
   server.on('checkExpectation', handleExpect);
+  server.on('connect', handleConnect);
   return server;
 }
 
@@ -231,15 +263,36 @@ function startServer() {
       + `http://${host}:${boundPort}${HEALTH_PATH}`);
   });
 
+  let closing = false;
   const shutdown = function () {
-    // A connection with no request in flight is released first: close() would wait
-    // for it, so a caller that opened a socket and sent nothing would delay the exit.
-    if (typeof server.closeIdleConnections === 'function') {
-      server.closeIdleConnections();
+    // A second signal while the first is still being honoured must not start over: close() would
+    // report ERR_SERVER_NOT_RUNNING and another timer would be armed for nothing.
+    if (closing) {
+      return;
     }
+    closing = true;
+    // Stop accepting, then exit as soon as the last connection has gone.
     server.close(function () {
       process.exit(0);
     });
+    // A connection with no request in flight is released first, because close() would otherwise
+    // wait for it.
+    if (typeof server.closeIdleConnections === 'function') {
+      server.closeIdleConnections();
+    }
+    // That is not enough on its own: a caller that opened a socket and sent nothing - which is
+    // exactly what a load-balancer TCP probe and a port scanner do, and this endpoint attracts
+    // both - is not counted as idle, so close() would wait on it indefinitely and the process
+    // would outlive its signal until the peer hung up or SIGKILL arrived. Destroying every
+    // remaining connection after a short grace window bounds the exit while still letting a
+    // response already being written finish. unref() so the timer itself never keeps the loop
+    // alive once there is nothing left to wait for.
+    const escalation = setTimeout(function () {
+      if (typeof server.closeAllConnections === 'function') {
+        server.closeAllConnections();
+      }
+    }, SHUTDOWN_GRACE_MS);
+    escalation.unref();
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
