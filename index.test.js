@@ -50,8 +50,6 @@ const SERVE_BANNER_PATTERN =
 
 const SERVE_TIMEOUT_MS = 15000;
 
-
-
 // Bind tests to loopback port 0 to avoid collisions.
 const LOOPBACK_HOST = '127.0.0.1';
 const EPHEMERAL_PORT = 0;
