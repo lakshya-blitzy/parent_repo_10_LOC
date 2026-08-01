@@ -1,6 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const net = require('node:net');
+const { spawnSync } = require('node:child_process');
 const pkg = require('./package.json');
 const app = require('./index.js');
 
@@ -31,6 +32,18 @@ const METHOD_NOT_ALLOWED_BODY = '{"error":"Method Not Allowed"}';
 const REJECTED_METHODS = ['POST', 'OPTIONS', 'DELETE', 'FOO'];
 
 const NON_ROUTES = ['/nope', '/health/', '/HEALTH', '/%68ealth', '//health'];
+
+// What `node index.js` must write, byte for byte, when it is given no arguments:
+// the sum on five lines and nothing else. Built from the repeat rather than typed
+// out so the count is stated once and cannot drift from the assertion below.
+const DEFAULT_RUN_LINES = 5;
+const DEFAULT_RUN_STDOUT = '12\n'.repeat(DEFAULT_RUN_LINES);
+
+// Resolved rather than joined, so the assertion follows the module under test.
+const ENTRY_POINT = require.resolve('./index.js');
+
+// A default run must not be able to outlive the suite, whatever it does.
+const DEFAULT_RUN_TIMEOUT_MS = 10000;
 
 // Bind tests to loopback port 0 to avoid collisions.
 const LOOPBACK_HOST = '127.0.0.1';
@@ -166,12 +179,42 @@ async function awaitLaterTimestamp(address, seen) {
     + `${FRESHNESS_TIMEOUT_MS} ms, so the timestamp is not generated per request`);
 }
 
-test('the pre-existing addition capability is exported and still returns 12',
-  function () {
+test('the pre-existing capability is exported, and the default run still prints it '
+  + 'five times', function () {
     assert.equal(typeof app.add, 'function');
     assert.equal(app.add(5, 7), 12);
     assert.equal(app.add(0, 0), 0);
     assert.equal(app.add(-2, 5), 3);
+
+    // Calling add() proves the function. It cannot prove the program: the
+    // `require.main === module` branch is what an operator actually runs, and it is
+    // the branch the --serve gate exists to protect, because a process that binds a
+    // socket never exits and would have replaced these writes rather than added to
+    // them. So the program is run, in a real child process, with no arguments.
+    const run = spawnSync(process.execPath, [ENTRY_POINT], {
+      encoding: 'utf8',
+      timeout: DEFAULT_RUN_TIMEOUT_MS,
+      // An inherited stdio would let the child write into the reporter's stream
+      // instead of into a buffer this test can compare.
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+
+    // spawnSync reports a failure to start, or a timeout, through `error` rather
+    // than through the exit code, so that is checked before anything else.
+    assert.equal(run.error, undefined,
+      `node ${ENTRY_POINT} did not run to completion: ${run.error && run.error.message}`);
+    // A listener started without the flag would have been killed by the timeout,
+    // which surfaces as a signal rather than a status.
+    assert.equal(run.signal, null, `the default run was terminated by ${run.signal}`);
+    assert.equal(run.status, 0, `the default run exited ${run.status}`);
+    // Every observable result is part of the preserved behaviour, so each is
+    // asserted: a startup banner, a deprecation warning on stderr or a changed exit
+    // code is a change even when the first line still reads correctly.
+    assert.equal(run.stderr, '', `the default run wrote to stderr: ${run.stderr}`);
+    assert.equal(run.stdout, DEFAULT_RUN_STDOUT);
+    assert.equal(run.stdout.split('\n').length - 1, DEFAULT_RUN_LINES);
+    // The gate is stated in bytes, so the byte length is what is compared.
+    assert.equal(Buffer.byteLength(run.stdout), 15);
   });
 
 test('GET /health responds 200 with the four-field health document',
