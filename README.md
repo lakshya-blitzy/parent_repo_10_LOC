@@ -146,6 +146,25 @@ Each submodule hop is a separate fetch against a separate remote, so the network
 
 Beside the tracked content listed above, a checkout also carries Git's own metadata, which is not project content: a `.git` directory here, and a `.git` file holding a `gitdir:` pointer inside each submodule working tree.
 
+### Confirming which revision a clone acquired
+
+The clone command above names no ref, so it checks out whatever ref the remote reports as its default, and that default is mutable state rather than a property of this document. Confirm which revision a clone produced by running this inside it:
+
+```bash
+wc -l README.md child_repo_10_LOC/README.md child_repo_10_LOC/nested_child_repo_10_LOC/README.md
+```
+
+**Measured outcome for the revision this document is committed in:** `313`, `214`, and `213`. A count of `0` on any of the three is a README that predates this documentation: those files hold a single heading line with no trailing newline, and so no line feed for `wc` to count, the child's heading reads `# chile_repo_10_LOC` there, and no source file in that revision carries a doc comment.
+
+If the counts do not match, list the refs this remote publishes and the one its default resolves to:
+
+```bash
+git ls-remote --heads https://github.com/lakshya-blitzy/parent_repo_10_LOC.git
+git ls-remote --symref https://github.com/lakshya-blitzy/parent_repo_10_LOC.git HEAD
+```
+
+Pass the head that carries this documentation to `git clone --branch`, or fetch it into an existing clone and check it out, then re-run `git submodule update --init --recursive` so both submodule working trees follow the pins that revision records. No ref name is quoted here because none is stable: no repository in the composition publishes a tag, and a branch head is mutable state that the commands above report authoritatively.
+
 ### Acquisition sequence
 
 ```mermaid
