@@ -103,7 +103,7 @@ Setup is acquisition only. No file in the composition declares a dependency — 
 |---|---|---|---|
 | Node.js | ES2015 | The block-scoped `const` at `[index.js:L12]`, the only post-ES5 construct in the module | This repository |
 | CPython | 3.6 or later | The f-string at `[child_repo_10_LOC/app.py:L10]`, the release in which f-strings became available | The child only |
-| A JDK providing `javac` and `java` | No meaningful floor | `[child_repo_10_LOC/nested_child_repo_10_LOC/User.java]` uses only `String` locals and `System.out.println`, both Java 1.0-era constructs | The nested child only |
+| A JDK providing `javac` and `java` | No meaningful floor | `User.java` uses only `String` locals, at `[child_repo_10_LOC/nested_child_repo_10_LOC/User.java:L11]` and `[child_repo_10_LOC/nested_child_repo_10_LOC/User.java:L25]`, and `System.out.println`, at `[child_repo_10_LOC/nested_child_repo_10_LOC/User.java:L12]` and `[child_repo_10_LOC/nested_child_repo_10_LOC/User.java:L26]` — both Java 1.0-era constructs | The nested child only |
 
 Nothing in the composition declares a runtime or toolchain version: there is no `.nvmrc`, `.python-version`, `.tool-versions`, `.java-version`, `package.json`, `pyproject.toml`, `pom.xml`, or `build.gradle` at any level. **No concrete release is therefore asserted here.** Each floor above is the language level the source itself implies, and nothing more. Only Node.js is a prerequisite of this repository; the other two rows are listed so that a reader of the apex knows what acquiring the whole composition requires, and each level's own README states its own prerequisite.
 
