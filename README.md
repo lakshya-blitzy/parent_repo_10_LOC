@@ -92,9 +92,13 @@ of them ever repeats the path that was asked for or the method that was used, an
 none of them is ever HTML. An unrecognised method — `OPTIONS`, or a verb invented
 on the spot — is answered `405` with the same JSON envelope and the same `Allow`
 field, never `501`. A `CONNECT` is answered too — `405` on the route and `404`
-anywhere else — because silence is not one of this contract's answers. Only a
-`405` carries `Allow`: a `404` or a `400` would otherwise name a method that works
-on an address this endpoint does not serve, or on a message it never accepted.
+anywhere else — because silence is not one of this contract's answers, and it is
+answered under the same decision order as every other request even though the
+runtime hands it to a listener outside the normal request pipeline: an HTTP/1.1
+`CONNECT` that carries no `Host` field is a `400` before its target or its method
+is looked at. Only a `405` carries `Allow`: a `404` or a `400` would otherwise
+name a method that works on an address this endpoint does not serve, or on a
+message it never accepted.
 
 RFC 9112 requires every HTTP/1.1 request to carry a `Host` field, and one that
 does not is answered `400 Bad Request` with body `{"error":"Bad Request"}` — the
@@ -279,7 +283,10 @@ with `# pass 5` and `# fail 0`. The five tests cover:
   an empty `Host` value and a lower-case field name; and the exported classifier's
   verdict on each of those packets, asserted directly as well as over a socket;
 - **every method the route rejects** — `405` with its `Allow` field, including a
-  verb invented on the spot and a `CONNECT` that never reaches the router.
+  verb invented on the spot and a `CONNECT` that never reaches the router, sent
+  both with the `Host` field HTTP/1.1 requires and as an `HTTP/1.0` request that
+  owes none, so the `400` its 1.1 form earns for omitting the field is pinned as a
+  contrast rather than asserted alone.
 
 The suite is built only from what the runtime already ships — `node:test`,
 `node:assert/strict`, `node:net`, `node:child_process` and the global `fetch` —

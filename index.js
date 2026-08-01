@@ -67,17 +67,30 @@ function sendJson(res, status, body, extraHeaders) {
   res.end(payload);
 }
 
-// The single routing decision: path first, method second, and every inbound entry
-// point below dispatches through here. Query and fragment are stripped as the siblings
-// strip them; the error bodies are fixed literals that echo nothing of the request.
+// Whether a parsed request is an HTTP/1.1 message carrying no Host field, which RFC 9112
+// requires a server to answer with a 400 - and which it requires of no HTTP/1.0 message, so
+// only 1.1 is held to it. Node checks this itself, but its rejection answers with a chunked,
+// bodiless 400 written before any code here is reached - no Content-Type, no Content-Length,
+// no Cache-Control and no JSON - so the check is made here instead, with Node's own one turned
+// off at createServer. One predicate serves both paths that receive a parsed request, the
+// router and the CONNECT listener, so neither can drift from the other's ordering; the packet
+// counterpart for a request the parser refused outright is lacksHostField. A request whose
+// header map is missing entirely is not treated as one that omitted the field: an absent map
+// is not evidence about what was sent, and this predicate answers a question about the wire.
+function lacksHostHeader(req) {
+  const fields = req.headers || {};
+  return req.httpVersionMajor === 1 && req.httpVersionMinor === 1
+    && fields.host === undefined;
+}
+
+// The single routing decision: Host first, then path, then method - the order the Python and
+// Java siblings apply, so a request that is wrong in more than one way is answered the same way
+// by all three. Every inbound entry point below dispatches through here or, where there is no
+// ServerResponse to write through, applies the same ordering against the same predicates.
+// Query and fragment are stripped as the siblings strip them; the error bodies are fixed
+// literals that echo nothing of the request.
 function routeRequest(req, res) {
-  // RFC 9110 requires a 400 for an HTTP/1.1 request that carries no Host field. Node checks
-  // that itself, but its rejection answers with a chunked, bodiless 400 written before this
-  // function is reached - no Content-Type, no Content-Length, no Cache-Control and no JSON.
-  // The check is therefore made here, with Node's own one turned off at createServer, so this
-  // answer comes from the one writer every other answer comes from.
-  if (req.httpVersionMajor === 1 && req.httpVersionMinor === 1
-    && req.headers.host === undefined) {
+  if (lacksHostHeader(req)) {
     sendJson(res, 400, { error: 'Bad Request' });
     return;
   }
@@ -257,12 +270,19 @@ function handleClientError(error, socket) {
 // A CONNECT request is taken out of the normal request pipeline by Node, which hands it to a
 // 'connect' listener and, when there is none, closes the socket without answering at all. Silence
 // is not one of this contract's answers, so the request is routed here instead - with the same
-// path-then-method ordering, through the same socket-level writer a refused request uses. There is
+// Host-then-target ordering, through the same socket-level writer a refused request uses. There is
 // no ServerResponse to write through on this path, and no body to serve either: CONNECT is never
-// GET or HEAD, so the route can only owe it a 405, and any other target a 404. (An Upgrade request
-// needs no counterpart: Node leaves those in the normal pipeline, where routeRequest answers them.)
+// GET or HEAD, so the route can only owe it a 405, and any other target a 404 - unless the request
+// is an HTTP/1.1 one with no Host, which is answered 400 before either is looked at, exactly as
+// routeRequest and refusedRequestStatus answer it. Being handed a request outside the normal
+// pipeline is not a reason to judge it by a different order. (An Upgrade request needs no
+// counterpart: Node leaves those in the normal pipeline, where routeRequest answers them.)
 function handleConnect(req, socket) {
   if (!socket || !socket.writable) {
+    return;
+  }
+  if (lacksHostHeader(req)) {
+    sendRawJson(socket, 400);
     return;
   }
   const path = (req.url || '').split('?')[0].split('#')[0];
@@ -274,7 +294,8 @@ function handleConnect(req, socket) {
 // application code here, so no answer this listener produces is a framework default.
 function createServer() {
   // requireHostHeader is turned off so that Node's own bodiless, chunked 400 cannot be written
-  // ahead of the router; routeRequest makes the same check and answers it through sendJson.
+  // ahead of the router; lacksHostHeader makes the same check on both paths that receive a
+  // parsed request, and each answers it through this contract's own writer.
   const server = http.createServer({ requireHostHeader: false }, routeRequest);
   server.on('clientError', handleClientError);
   server.on('checkContinue', handleExpect);

@@ -626,14 +626,44 @@ test('HEAD /health returns the GET headers without a body', async function () {
 // router; a request line the parser refuses is handed to 'clientError'. None of them reaches
 // routeRequest, and every one of them must still be answered as JSON with the same three headers
 // every routed answer carries. Each shape is asserted by the test that owns the status it is owed:
-// the 405 shape below by the method test, the rest by the refusal test. Status lines are written
+// the 405 shapes below by the method test, the rest by the refusal test. Status lines are written
 // out in full rather than composed, so the test states the wire bytes it expects.
+//
+// The four CONNECT shapes differ only in what is wrong with the request, which is how they pin the
+// ordering: being taken out of the pipeline is not a reason to be judged by a different order, so
+// the missing Host field is answered before the target and the method are looked at, exactly as
+// the router and the classifier answer it - and the HTTP/1.0 shape holds that rule to the version
+// that carries it, since HTTP/1.0 owes no Host field and is therefore still a 405.
 function bypassCases(address) {
   const authority = `${address.host}:${address.port}`;
   return [
     {
       name: 'CONNECT on the route',
       request: `CONNECT ${HEALTH_PATH} HTTP/1.1\r\nHost: ${authority}\r\n\r\n`,
+      status: 405,
+      statusLine: 'HTTP/1.1 405 Method Not Allowed',
+      body: METHOD_NOT_ALLOWED_BODY,
+      allow: EXPECTED_ALLOW,
+      absent: ['CONNECT']
+    },
+    {
+      // The same CONNECT with the field left off. Node does not refuse it - the server turns its
+      // own Host check off - so it arrives at the 'connect' listener, where the field is checked
+      // before the target. Without that check the method alone would earn it the 405 above, which
+      // is a different answer from the one the router gives the same omission.
+      name: 'CONNECT on the route with no Host field',
+      request: `CONNECT ${HEALTH_PATH} HTTP/1.1\r\n\r\n`,
+      status: 400,
+      statusLine: 'HTTP/1.1 400 Bad Request',
+      body: BAD_REQUEST_BODY,
+      allow: null,
+      absent: ['CONNECT']
+    },
+    {
+      // And the contrast that keeps the check from being over-broad: the field belongs to
+      // HTTP/1.1, so a 1.0 CONNECT that omits it is owed the 405 its method earns.
+      name: 'CONNECT on the route as HTTP/1.0, which owes no Host field',
+      request: `CONNECT ${HEALTH_PATH} HTTP/1.0\r\n\r\n`,
       status: 405,
       statusLine: 'HTTP/1.1 405 Method Not Allowed',
       body: METHOD_NOT_ALLOWED_BODY,
@@ -795,9 +825,11 @@ test('requests this endpoint does not serve are refused as JSON - 404 for an unk
       }
     }
 
-    // The same refusal, for the shapes that never reach the router at all: a CONNECT whose
-    // target is not the route, an HTTP/1.1 request with no Host field, and two request lines
-    // Node's own parser rejects before a request object exists.
+    // The same refusal, for the shapes that never reach the router at all: a CONNECT whose target
+    // is not the route, a CONNECT that omits the Host field its version requires, an ordinary
+    // HTTP/1.1 request that omits it, and the request lines Node's own parser rejects before a
+    // request object exists. The two CONNECT shapes and the ordinary one are answered the same way
+    // for the same omission, which is the ordering this table exists to pin.
     for (const shape of bypassCases(address)) {
       if (shape.status !== 405) {
         await assertRefusedInsideContract(address, shape);
@@ -903,7 +935,10 @@ test('unsupported methods respond 405 and advertise the allowed methods',
 
       // A CONNECT is the one unsupported method no client will send for you: Node hands it to a
       // 'connect' listener instead of the router, and with none the socket would be closed
-      // unanswered. It owes the route the same 405 every other verb does.
+      // unanswered. It owes the route the same 405 every other verb does - once it is a request
+      // this contract will look at the method of, which means one that carries the Host field
+      // HTTP/1.1 requires, or one sent as HTTP/1.0, which owes none. The 1.1 shape that omits it
+      // is a 400 and is asserted with the other refusals, where that answer belongs.
       for (const shape of bypassCases(address)) {
         if (shape.status === 405) {
           await assertRefusedInsideContract(address, shape);
