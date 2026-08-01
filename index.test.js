@@ -46,9 +46,50 @@ const ENTRY_POINT = require.resolve('./index.js');
 // A default run must not be able to outlive the suite, whatever it does.
 const DEFAULT_RUN_TIMEOUT_MS = 10000;
 
+// The startup line `--serve` prints, and the whole of it: the application's own name
+// and version, the address it bound, and the route it serves. Anchored, so a banner
+// that grew a host name, a process identifier or an environment value fails here.
+const SERVE_BANNER_PATTERN =
+  /^parent_repo_10_LOC 1\.0\.0 health endpoint listening on http:\/\/127\.0\.0\.1:(\d+)\/health\n$/;
+
+// How long a spawned `--serve` process is given to print its banner, and then to honour
+// the signal that stops it. Generous enough for a cold start on a loaded machine, short
+// enough that a listener which ignores its signal fails an assertion rather than hanging.
+const SERVE_TIMEOUT_MS = 15000;
+
+
+
 // Bind tests to loopback port 0 to avoid collisions.
 const LOOPBACK_HOST = '127.0.0.1';
 const EPHEMERAL_PORT = 0;
+
+// Every documented HOST form, and what it must resolve to. A blank or absent value must
+// never be read as "every interface", which is the one mistake here that would put the
+// endpoint on the network; a padded value is trimmed to the address it names.
+const HOST_CASES = [
+  [{}, LOOPBACK_HOST],
+  [{ HOST: '' }, LOOPBACK_HOST],
+  [{ HOST: '   ' }, LOOPBACK_HOST],
+  [{ HOST: ' 0.0.0.0 ' }, '0.0.0.0'],
+  [{ HOST: '127.0.0.2' }, '127.0.0.2']
+];
+
+// Every documented PORT form. All but the last three are malformed in some way, and each
+// must fall back rather than abort start-up: a typo in a supervisor's unit file must not
+// become a crash loop. 0 is honoured, because it is how an ephemeral port is asked for.
+const PORT_CASES = [
+  [{}, EXPECTED_DEFAULT_PORT],
+  [{ PORT: '' }, EXPECTED_DEFAULT_PORT],
+  [{ PORT: '   ' }, EXPECTED_DEFAULT_PORT],
+  [{ PORT: '3000abc' }, EXPECTED_DEFAULT_PORT],
+  [{ PORT: '+3000' }, EXPECTED_DEFAULT_PORT],
+  [{ PORT: '-1' }, EXPECTED_DEFAULT_PORT],
+  [{ PORT: '65536' }, EXPECTED_DEFAULT_PORT],
+  [{ PORT: '99999999999' }, EXPECTED_DEFAULT_PORT],
+  [{ PORT: '0' }, EPHEMERAL_PORT],
+  [{ PORT: ' 000080 ' }, 80],
+  [{ PORT: '8123' }, 8123]
+];
 
 // Bound exchanges so a nonresponding handler cannot hang the suite.
 const EXCHANGE_TIMEOUT_MS = 5000;
@@ -167,28 +208,63 @@ function headerValue(response, name) {
   return value === null ? '' : value;
 }
 
-// Bound each exchange so a nonresponding handler fails the test instead of hanging it.
-async function request(url, options) {
-  const settings = Object.assign({}, options);
-  if (settings.signal === undefined) {
-    settings.signal = AbortSignal.timeout(EXCHANGE_TIMEOUT_MS);
+// The environment a spawned child sees: this process's, with the overrides applied and
+// any key given as undefined removed. Built as a copy so that setting a variable for a
+// child never sets it for the suite - process.env is shared by every module in this
+// process, and a resolver case or a startup probe must not be observable outside itself.
+function childEnvironment(overrides) {
+  const environment = Object.assign({}, process.env, overrides);
+  for (const name of Object.keys(overrides)) {
+    if (overrides[name] === undefined) {
+      delete environment[name];
+    }
   }
-  try {
-    const response = await fetch(url, settings);
-    const text = await response.text();
-    return { response, text };
-  } catch (cause) {
-    throw new Error(`[${settings.method || 'GET'} ${url}] did not complete within `
-      + `${EXCHANGE_TIMEOUT_MS} ms: ${cause.message}`, { cause });
-  }
+  return environment;
 }
 
-function delay(ms) {
-  return new Promise(function (resolve) {
-    setTimeout(resolve, ms);
+// Runs `node index.js --serve` under the given environment, resolves once it has written
+// its startup line, and then stops it with the signal a supervisor would send.
+//
+// This is the only exercise of the --serve branch end to end: everything else in this
+// file binds its own server through createServer(), which never reads the environment and
+// never installs a signal handler. The child is bounded twice over - a timeout on the
+// banner and a timeout on the shutdown - so neither a listener that never reports itself
+// nor one that ignores its signal can hang the suite.
+function serve(overrides) {
+  return new Promise(function (resolve, reject) {
+    const child = spawn(process.execPath, [ENTRY_POINT, '--serve'], {
+      env: childEnvironment(overrides),
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    let stdout = '';
+    let stderr = '';
+    let stopping = false;
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    const abandon = setTimeout(function () {
+      child.kill('SIGKILL');
+    }, SERVE_TIMEOUT_MS);
+    child.stdout.on('data', function (chunk) {
+      stdout += chunk;
+      // One complete line is the whole banner, and the point at which the listener is
+      // known to be bound, so that is when the signal goes.
+      if (!stopping && stdout.endsWith('\n')) {
+        stopping = true;
+        child.kill('SIGTERM');
+      }
+    });
+    child.stderr.on('data', function (chunk) {
+      stderr += chunk;
+    });
+    child.on('error', reject);
+    child.on('close', function (code, signal) {
+      clearTimeout(abandon);
+      resolve({ stdout, stderr, code, signal, signalled: stopping });
+    });
   });
 }
 
+// Bound each exchange so a nonresponding handler fails the test instead of hanging it.
 // Fail awaited work at a bound rather than let it hang the suite. The timer is cleared on
 // every outcome, so a settled race cannot keep the event loop alive after the test returns.
 function withDeadline(work, ms, message) {
@@ -307,6 +383,27 @@ function portIsReleased(port) {
   });
 }
 
+async function request(url, options) {
+  const settings = Object.assign({}, options);
+  if (settings.signal === undefined) {
+    settings.signal = AbortSignal.timeout(EXCHANGE_TIMEOUT_MS);
+  }
+  try {
+    const response = await fetch(url, settings);
+    const text = await response.text();
+    return { response, text };
+  } catch (cause) {
+    throw new Error(`[${settings.method || 'GET'} ${url}] did not complete within `
+      + `${EXCHANGE_TIMEOUT_MS} ms: ${cause.message}`, { cause });
+  }
+}
+
+function delay(ms) {
+  return new Promise(function (resolve) {
+    setTimeout(resolve, ms);
+  });
+}
+
 // Poll until the second-precision timestamp changes, with a bounded wait.
 async function awaitLaterTimestamp(address, seen) {
   const deadline = Date.now() + FRESHNESS_TIMEOUT_MS;
@@ -323,8 +420,9 @@ async function awaitLaterTimestamp(address, seen) {
     + `${FRESHNESS_TIMEOUT_MS} ms, so the timestamp is not generated per request`);
 }
 
-test('the pre-existing capability is exported, and the default run still prints it '
-  + 'five times', function () {
+test('the pre-existing capability is exported, requiring the module has no effect of its '
+  + 'own, the default run still prints it five times, --serve binds only where HOST and '
+  + 'PORT say, and a signalled listener exits cleanly', async function () {
     assert.equal(typeof app.add, 'function');
     assert.equal(app.add(5, 7), 12);
     assert.equal(app.add(0, 0), 0);
@@ -359,6 +457,66 @@ test('the pre-existing capability is exported, and the default run still prints 
     assert.equal(run.stdout.split('\n').length - 1, DEFAULT_RUN_LINES);
     // The gate is stated in bytes, so the byte length is what is compared.
     assert.equal(Buffer.byteLength(run.stdout), 15);
+
+    // Requiring the module must be silent too, and this file's own require() cannot show
+    // that: by the time any test runs the module is already in require.cache, and
+    // anything it wrote at load time went to the reporter's streams before the first test
+    // was collected. So a fresh process is asked to require it and do nothing else. A
+    // write at module scope fails here; so does a listener started at load, because the
+    // process would never reach its own exit and the timeout would end the test instead.
+    const imported = spawnSync(process.execPath,
+      ['-e', `require(${JSON.stringify(ENTRY_POINT)});`], {
+        encoding: 'utf8',
+        timeout: DEFAULT_RUN_TIMEOUT_MS,
+        stdio: ['ignore', 'pipe', 'pipe']
+      });
+    assert.equal(imported.error, undefined,
+      `requiring ${ENTRY_POINT} did not run to completion: `
+        + `${imported.error && imported.error.message}`);
+    assert.equal(imported.signal, null,
+      `requiring the module was terminated by ${imported.signal}`);
+    assert.equal(imported.status, 0, `requiring the module exited ${imported.status}`);
+    assert.equal(imported.stdout, '',
+      `requiring the module wrote to stdout: ${imported.stdout}`);
+    assert.equal(imported.stderr, '',
+      `requiring the module wrote to stderr: ${imported.stderr}`);
+
+    // Where the listener is placed is decided by two resolvers, asserted as the pure
+    // functions of a mapping they are: no case writes into process.env, which the whole
+    // process shares, and none has to bind a socket to be observed.
+    for (const [environment, expected] of HOST_CASES) {
+      assert.equal(app.resolveHost(environment), expected,
+        `HOST=${JSON.stringify(environment.HOST)}`);
+    }
+    for (const [environment, expected] of PORT_CASES) {
+      assert.equal(app.resolvePort(environment), expected,
+        `PORT=${JSON.stringify(environment.PORT)}`);
+    }
+    assert.equal(app.resolveHost(), app.DEFAULT_HOST);
+    assert.equal(app.resolvePort(), app.DEFAULT_PORT);
+
+    // And then the branch those resolvers serve, run for real. PORT=0 asks for an
+    // ephemeral port, so the check never competes for the default one, and HOST is removed
+    // from the child's environment alone so the default bind address is what is observed.
+    const served = await serve({ PORT: String(EPHEMERAL_PORT), HOST: undefined });
+    const banner = SERVE_BANNER_PATTERN.exec(served.stdout);
+    assert.notEqual(banner, null, `the startup line was [${served.stdout}]`);
+    const boundPort = Number(banner[1]);
+    assert.ok(boundPort > 0, `no ephemeral port was reported: ${boundPort}`);
+    assert.notEqual(boundPort, EXPECTED_DEFAULT_PORT,
+      'an ephemeral request bound the default port, so PORT=0 was not honoured');
+    assert.equal(served.stderr, '', `--serve wrote to stderr: ${served.stderr}`);
+    // The signal handler closes the server and exits 0 of its own accord, so a clean
+    // status - rather than a termination by signal - is what proves it ran and that the
+    // port was released instead of being held until the process was killed.
+    assert.ok(served.signalled, 'the child was never signalled, so it printed no banner');
+    assert.equal(served.signal, null, `--serve was killed by ${served.signal}`);
+    assert.equal(served.code, 0, `--serve exited ${served.code} on SIGTERM`);
+
+    // And the same listener held to the rest of what an operator needs of it: both signals a
+    // supervisor sends, a second one arriving while the first is still being honoured, a caller
+    // holding a connection it has sent nothing on, and the port given back afterwards.
+    await assertASignalledListenerExitsCleanly();
   });
 
 test('GET /health responds 200 with the four-field health document',
@@ -415,6 +573,18 @@ test('GET /health responds 200 with the four-field health document',
       const later = await awaitLaterTimestamp(address, payload.timestamp);
       assert.match(later, TIMESTAMP_PATTERN);
       assert.notEqual(later, payload.timestamp);
+
+      // Host is mandatory only from HTTP/1.1 onward, so a valid HTTP/1.0 request that omits it
+      // must still be served the document rather than refused. Sent over a raw socket because a
+      // client will not speak HTTP/1.0 without a Host field on request.
+      const legacy = await rawSend(address, `GET ${HEALTH_PATH} HTTP/1.0\r\n\r\n`,
+        'HTTP/1.0 with no Host field');
+      assert.equal(legacy.head.split('\r\n')[0], 'HTTP/1.1 200 OK',
+        `an HTTP/1.0 request was refused: [${legacy.head}]`);
+      const document = JSON.parse(legacy.body.toString('utf8'));
+      assert.deepEqual(Object.keys(document), EXPECTED_KEYS);
+      assert.equal(document.status, EXPECTED_STATUS);
+      assert.equal(document.name, EXPECTED_NAME);
     });
   });
 
@@ -450,7 +620,116 @@ test('HEAD /health returns the GET headers without a body', async function () {
   });
 });
 
-test('unknown paths respond 404 with the fixed error envelope', async function () {
+// Every inbound shape Node takes out of the normal request pipeline, paired with the answer the
+// contract owes it. A CONNECT is handed to a 'connect' listener and, with none, the socket is
+// closed unanswered; an HTTP/1.1 request with no Host is refused by Node itself, ahead of the
+// router; a request line the parser refuses is handed to 'clientError'. None of them reaches
+// routeRequest, and every one of them must still be answered as JSON with the same three headers
+// every routed answer carries. Each shape is asserted by the test that owns the status it is owed:
+// the 405 shape below by the method test, the rest by the refusal test. Status lines are written
+// out in full rather than composed, so the test states the wire bytes it expects.
+function bypassCases(address) {
+  const authority = `${address.host}:${address.port}`;
+  return [
+    {
+      name: 'CONNECT on the route',
+      request: `CONNECT ${HEALTH_PATH} HTTP/1.1\r\nHost: ${authority}\r\n\r\n`,
+      status: 405,
+      statusLine: 'HTTP/1.1 405 Method Not Allowed',
+      body: METHOD_NOT_ALLOWED_BODY,
+      allow: EXPECTED_ALLOW,
+      absent: ['CONNECT']
+    },
+    {
+      // The authority form RFC 9110 defines for CONNECT: a host and port, no path at all.
+      name: 'CONNECT in authority form',
+      request: `CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\n\r\n`,
+      status: 404,
+      statusLine: 'HTTP/1.1 404 Not Found',
+      body: NOT_FOUND_BODY,
+      allow: null,
+      absent: ['CONNECT', address.host]
+    },
+    {
+      name: 'HTTP/1.1 with no Host field',
+      request: `GET ${HEALTH_PATH} HTTP/1.1\r\n\r\n`,
+      status: 400,
+      statusLine: 'HTTP/1.1 400 Bad Request',
+      body: BAD_REQUEST_BODY,
+      allow: null,
+      absent: []
+    },
+    {
+      name: 'a method token split by a space',
+      request: `GE T ${HEALTH_PATH} HTTP/1.1\r\nHost: ${authority}\r\n\r\n`,
+      status: 400,
+      statusLine: 'HTTP/1.1 400 Bad Request',
+      body: BAD_REQUEST_BODY,
+      allow: null,
+      absent: ['GE T']
+    },
+    {
+      name: 'an empty request target',
+      request: `GET  HTTP/1.1\r\nHost: ${authority}\r\n\r\n`,
+      status: 400,
+      statusLine: 'HTTP/1.1 400 Bad Request',
+      body: BAD_REQUEST_BODY,
+      allow: null,
+      absent: []
+    }
+  ];
+}
+
+// Asserts one of those shapes against the contract. Shared by the two tests below rather than
+// owned by a test of its own, so each shape is asserted alongside the routed requests that are
+// answered with the same status.
+async function assertRefusedInsideContract(address, shape) {
+  const context = shape.name;
+  const wire = await rawSend(address, shape.request, context);
+  const statusLine = wire.head.split('\r\n')[0];
+  const body = wire.body.toString('utf8');
+  const head = wire.head.toLowerCase();
+
+  // Silence is not one of this contract's answers, so the answer is checked before anything
+  // about it: an empty reply never terminates its head and rawSend would already have failed,
+  // and a wrong status is reported with the line that arrived.
+  assert.equal(statusLine, shape.statusLine, context);
+  assert.ok(head.includes(`content-type: ${EXPECTED_MEDIA_TYPE}`),
+    `${context}: not served as JSON: [${wire.head}]`);
+  assert.ok(!head.includes('text/html'),
+    `${context}: answered with markup: [${wire.head}]`);
+  assert.ok(head.includes(`cache-control: ${EXPECTED_CACHE_CONTROL}`),
+    `${context}: a liveness answer was left cacheable: [${wire.head}]`);
+  // RFC 9110 requires Date from a server that has a clock, and this path writes it by hand
+  // because no ServerResponse does it here.
+  assert.ok(head.includes('date: '), `${context}: no Date was sent: [${wire.head}]`);
+  // Nothing is read from the request, so the socket must not be offered for reuse with unread
+  // bytes still on it.
+  assert.ok(head.includes('connection: close'),
+    `${context}: the connection was offered for reuse: [${wire.head}]`);
+  const announced = /content-length: (\d+)/.exec(head);
+  assert.notEqual(announced, null, `${context}: no length was announced: [${wire.head}]`);
+  assert.equal(wire.body.length, Number(announced[1]), context);
+  assert.equal(body, shape.body, context);
+  if (shape.allow === null) {
+    assert.ok(!head.includes('allow:'),
+      `${context}: advertised allowed methods on a non-405: [${wire.head}]`);
+  } else {
+    assert.ok(head.includes(`allow: ${shape.allow.toLowerCase()}`),
+      `${context}: did not advertise the allowed methods: [${wire.head}]`);
+  }
+  // No name, version, runtime or diagnostic beyond the status may be disclosed.
+  assert.ok(!head.includes('server:'), `${context}: disclosed a Server field: [${wire.head}]`);
+  // The status line and the body are what the request could have been reflected into; the
+  // field names around them are the writer's own.
+  const answer = `${statusLine}\r\n${body}`;
+  for (const token of shape.absent) {
+    assert.ok(!answer.includes(token), `${context}: the answer echoed [${token}]: ${answer}`);
+  }
+}
+
+test('requests this endpoint does not serve are refused as JSON - 404 for an unknown path, '
+  + '400 for a request the router never sees', async function () {
   await withServer(async function (address) {
     for (const path of NON_ROUTES) {
       const context = `path ${path}`;
@@ -468,6 +747,26 @@ test('unknown paths respond 404 with the fixed error envelope', async function (
         `${context}: the error body echoed the request path`);
       assert.ok(!text.includes('<'), `${context}: the error body was not JSON`);
     }
+
+    // The same refusal, for the shapes that never reach the router at all: a CONNECT whose
+    // target is not the route, an HTTP/1.1 request with no Host field, and two request lines
+    // Node's own parser rejects before a request object exists.
+    for (const shape of bypassCases(address)) {
+      if (shape.status !== 405) {
+        await assertRefusedInsideContract(address, shape);
+      }
+    }
+
+    // The classifier those refusals are routed through, asserted directly as well: it is
+    // exported, so its verdicts can be checked without a socket, and these are the ones that
+    // separate a refusal the contract owes a 404 or a 405 from one it owes a 400.
+    assert.equal(app.refusedRequestStatus('HPE_INVALID_URL',
+      Buffer.from('GET /nope HTTP/1.1\r\n\r\n')), 404);
+    assert.equal(app.refusedRequestStatus('HPE_INVALID_METHOD',
+      Buffer.from(`GET ${HEALTH_PATH} HTTP/1.1\r\n\r\n`)), 400);
+    assert.equal(app.refusedRequestStatus('HPE_INVALID_CONSTANT',
+      Buffer.from(`FOO ${HEALTH_PATH} HTTP/1.1\r\n\r\n`)), 400);
+    assert.equal(app.refusedRequestStatus('HPE_INVALID_URL', Buffer.alloc(0)), 400);
   });
 });
 
@@ -514,184 +813,79 @@ test('unsupported methods respond 405 and advertise the allowed methods',
       assert.equal(body, METHOD_NOT_ALLOWED_BODY);
       assert.ok(!body.includes('FOO'),
         `the refusal echoed the request method: ${body}`);
-    });
-  });
 
-// Every inbound shape Node takes out of the normal request pipeline, paired with the answer the
-// contract owes it. A CONNECT is handed to a 'connect' listener and, with none, the socket is
-// closed unanswered; an HTTP/1.1 request with no Host is refused by Node itself, ahead of the
-// router, with a chunked bodiless 400; a request line the parser refuses is handed to
-// 'clientError'. None of them reaches routeRequest, and every one of them must still be answered
-// as JSON with the same three headers every routed answer carries. Status lines are written out
-// in full rather than composed, so the test states the wire bytes it expects.
-function bypassCases(address) {
-  const authority = `${address.host}:${address.port}`;
-  return [
-    {
-      name: 'CONNECT on the route',
-      request: `CONNECT ${HEALTH_PATH} HTTP/1.1\r\nHost: ${authority}\r\n\r\n`,
-      statusLine: 'HTTP/1.1 405 Method Not Allowed',
-      body: METHOD_NOT_ALLOWED_BODY,
-      allow: EXPECTED_ALLOW,
-      absent: ['CONNECT']
-    },
-    {
-      // The authority form RFC 9110 defines for CONNECT: a host and port, no path at all.
-      name: 'CONNECT in authority form',
-      request: `CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\n\r\n`,
-      statusLine: 'HTTP/1.1 404 Not Found',
-      body: NOT_FOUND_BODY,
-      allow: null,
-      absent: ['CONNECT', address.host]
-    },
-    {
-      name: 'HTTP/1.1 with no Host field',
-      request: `GET ${HEALTH_PATH} HTTP/1.1\r\n\r\n`,
-      statusLine: 'HTTP/1.1 400 Bad Request',
-      body: BAD_REQUEST_BODY,
-      allow: null,
-      absent: []
-    },
-    {
-      name: 'a method token split by a space',
-      request: `GE T ${HEALTH_PATH} HTTP/1.1\r\nHost: ${authority}\r\n\r\n`,
-      statusLine: 'HTTP/1.1 400 Bad Request',
-      body: BAD_REQUEST_BODY,
-      allow: null,
-      absent: ['GE T']
-    },
-    {
-      name: 'an empty request target',
-      request: `GET  HTTP/1.1\r\nHost: ${authority}\r\n\r\n`,
-      statusLine: 'HTTP/1.1 400 Bad Request',
-      body: BAD_REQUEST_BODY,
-      allow: null,
-      absent: []
-    }
-  ];
-}
-
-test('requests that never reach the router are still answered inside the JSON contract',
-  async function () {
-    await withServer(async function (address) {
+      // A CONNECT is the one unsupported method no client will send for you: Node hands it to a
+      // 'connect' listener instead of the router, and with none the socket would be closed
+      // unanswered. It owes the route the same 405 every other verb does.
       for (const shape of bypassCases(address)) {
-        const context = shape.name;
-        const wire = await rawSend(address, shape.request, context);
-        const statusLine = wire.head.split('\r\n')[0];
-        const body = wire.body.toString('utf8');
-        const head = wire.head.toLowerCase();
-
-        // Silence is not one of this contract's answers, so the answer is checked before
-        // anything about it: an empty reply never terminates its head and rawSend would
-        // already have failed, and a wrong status is reported with the line that arrived.
-        assert.equal(statusLine, shape.statusLine, context);
-        assert.ok(head.includes(`content-type: ${EXPECTED_MEDIA_TYPE}`),
-          `${context}: not served as JSON: [${wire.head}]`);
-        assert.ok(!head.includes('text/html'),
-          `${context}: answered with markup: [${wire.head}]`);
-        assert.ok(head.includes(`cache-control: ${EXPECTED_CACHE_CONTROL}`),
-          `${context}: a liveness answer was left cacheable: [${wire.head}]`);
-        // RFC 9110 requires Date from a server that has a clock, and this path writes it
-        // by hand because no ServerResponse does it here.
-        assert.ok(head.includes('date: '), `${context}: no Date was sent: [${wire.head}]`);
-        // Nothing is read from the request, so the socket must not be offered for reuse
-        // with unread bytes still on it.
-        assert.ok(head.includes('connection: close'),
-          `${context}: the connection was offered for reuse: [${wire.head}]`);
-        const announced = /content-length: (\d+)/.exec(head);
-        assert.notEqual(announced, null,
-          `${context}: no length was announced: [${wire.head}]`);
-        assert.equal(wire.body.length, Number(announced[1]), context);
-        assert.equal(body, shape.body, context);
-        if (shape.allow === null) {
-          assert.ok(!head.includes('allow:'),
-            `${context}: advertised allowed methods on a non-405: [${wire.head}]`);
-        } else {
-          assert.ok(head.includes(`allow: ${shape.allow.toLowerCase()}`),
-            `${context}: did not advertise the allowed methods: [${wire.head}]`);
-        }
-        // No name, version, runtime or diagnostic beyond the status may be disclosed.
-        assert.ok(!head.includes('server:'),
-          `${context}: disclosed a Server field: [${wire.head}]`);
-        // The status line and the body are what the request could have been reflected
-        // into; the field names around them are the writer's own.
-        const answer = `${statusLine}\r\n${body}`;
-        for (const token of shape.absent) {
-          assert.ok(!answer.includes(token),
-            `${context}: the answer echoed [${token}]: ${answer}`);
+        if (shape.status === 405) {
+          await assertRefusedInsideContract(address, shape);
         }
       }
-
-      // Host is mandatory only from HTTP/1.1 onward, so answering its absence must not turn a
-      // valid HTTP/1.0 request into a refusal.
-      const legacy = await rawSend(address, `GET ${HEALTH_PATH} HTTP/1.0\r\n\r\n`,
-        'HTTP/1.0 with no Host field');
-      assert.equal(legacy.head.split('\r\n')[0], 'HTTP/1.1 200 OK',
-        `an HTTP/1.0 request was refused: [${legacy.head}]`);
-      const document = JSON.parse(legacy.body.toString('utf8'));
-      assert.deepEqual(Object.keys(document), EXPECTED_KEYS);
-      assert.equal(document.status, EXPECTED_STATUS);
-      assert.equal(document.name, EXPECTED_NAME);
+      assert.equal(app.refusedRequestStatus('HPE_INVALID_METHOD',
+        Buffer.from(`FOO ${HEALTH_PATH} HTTP/1.1\r\n\r\n`)), 405);
     });
   });
 
-test('a signal ends the listener promptly even while a caller holds a connection it '
-  + 'never used', async function () {
-    for (const signal of SHUTDOWN_SIGNALS) {
-      const context = `signal ${signal}`;
-      const started = startServeProcess();
-      const announced = await withDeadline(started.ready, SERVE_START_TIMEOUT_MS,
-        `${context}: the listener announced no port within ${SERVE_START_TIMEOUT_MS} ms`);
-      const boundPort = Number(announced[4]);
-      let silent = null;
-      try {
-        assert.equal(announced[1], pkg.name, context);
-        assert.equal(announced[2], pkg.version, context);
-        assert.equal(announced[3], LOOPBACK_HOST, context);
-        assert.equal(announced[5], HEALTH_PATH, context);
-        // PORT=0 was asked for, so the banner must name the port actually assigned rather
-        // than the one requested.
-        assert.ok(boundPort > 0, `${context}: the banner reported port ${announced[4]}`);
+// Asserted from the default-run case above rather than as a case of its own: the listener is the
+// other half of running this file as a program, and it is only worth opting into if it also gives
+// the port back, so the signal path is held to the same standard as the banner it prints.
+async function assertASignalledListenerExitsCleanly() {
+  for (const signal of SHUTDOWN_SIGNALS) {
+    const context = `signal ${signal}`;
+    const started = startServeProcess();
+    const announced = await withDeadline(started.ready, SERVE_START_TIMEOUT_MS,
+      `${context}: the listener announced no port within ${SERVE_START_TIMEOUT_MS} ms`);
+    const boundPort = Number(announced[4]);
+    let silent = null;
+    try {
+      assert.equal(announced[1], pkg.name, context);
+      assert.equal(announced[2], pkg.version, context);
+      assert.equal(announced[3], LOOPBACK_HOST, context);
+      assert.equal(announced[5], HEALTH_PATH, context);
+      // PORT=0 was asked for, so the banner must name the port actually assigned rather
+      // than the one requested.
+      assert.ok(boundPort > 0, `${context}: the banner reported port ${announced[4]}`);
 
-        const probe = await request(`http://${LOOPBACK_HOST}:${boundPort}${HEALTH_PATH}`);
-        assert.equal(probe.response.status, 200,
-          `${context}: the listener never served the endpoint`);
-        assert.equal(JSON.parse(probe.text).status, EXPECTED_STATUS, context);
+      const probe = await request(`http://${LOOPBACK_HOST}:${boundPort}${HEALTH_PATH}`);
+      assert.equal(probe.response.status, 200,
+        `${context}: the listener never served the endpoint`);
+      assert.equal(JSON.parse(probe.text).status, EXPECTED_STATUS, context);
 
-        silent = await withDeadline(
-          connectSilently({ host: LOOPBACK_HOST, port: boundPort }),
-          EXCHANGE_TIMEOUT_MS,
-          `${context}: no connection could be opened to port ${boundPort}`);
+      silent = await withDeadline(
+        connectSilently({ host: LOOPBACK_HOST, port: boundPort }),
+        EXCHANGE_TIMEOUT_MS,
+        `${context}: no connection could be opened to port ${boundPort}`);
 
-        const ended = exitOf(started.child);
-        started.child.kill(signal);
-        // A second signal arriving while the first is still being honoured must change
-        // nothing: no second close, no second grace window, no error on the way out.
-        started.child.kill(signal);
-        const outcome = await withDeadline(ended, SHUTDOWN_TIMEOUT_MS,
-          `${context}: the listener was still running ${SHUTDOWN_TIMEOUT_MS} ms after the `
-            + 'signal while a caller held a connection it had sent nothing on');
+      const ended = exitOf(started.child);
+      started.child.kill(signal);
+      // A second signal arriving while the first is still being honoured must change
+      // nothing: no second close, no second grace window, no error on the way out.
+      started.child.kill(signal);
+      const outcome = await withDeadline(ended, SHUTDOWN_TIMEOUT_MS,
+        `${context}: the listener was still running ${SHUTDOWN_TIMEOUT_MS} ms after the `
+          + 'signal while a caller held a connection it had sent nothing on');
 
-        // Exit 0 with no signal code: the process must end because its handler closed the
-        // listener and returned, not because the signal killed it or a default handler did.
-        assert.equal(outcome.signal, null,
-          `${context}: the process was terminated by ${outcome.signal} instead of exiting`);
-        assert.equal(outcome.code, 0, `${context}: exited ${outcome.code}`);
-        assert.equal(started.stderr, '',
-          `${context}: wrote to stderr while shutting down: ${started.stderr}`);
-        // Exactly one banner line and nothing else: shutdown is silent.
-        assert.equal(started.stdout.split('\n').length - 1, 1,
-          `${context}: wrote more than the banner: ${JSON.stringify(started.stdout)}`);
-        assert.equal(await portIsReleased(boundPort), true,
-          `${context}: port ${boundPort} was still reachable after the process exited`);
-      } finally {
-        if (silent !== null) {
-          silent.destroy();
-        }
-        // Whatever the assertions found, no listener may outlive the test that started it.
-        if (!hasEnded(started.child)) {
-          started.child.kill('SIGKILL');
-        }
+      // Exit 0 with no signal code: the process must end because its handler closed the
+      // listener and returned, not because the signal killed it or a default handler did.
+      assert.equal(outcome.signal, null,
+        `${context}: the process was terminated by ${outcome.signal} instead of exiting`);
+      assert.equal(outcome.code, 0, `${context}: exited ${outcome.code}`);
+      assert.equal(started.stderr, '',
+        `${context}: wrote to stderr while shutting down: ${started.stderr}`);
+      // Exactly one banner line and nothing else: shutdown is silent.
+      assert.equal(started.stdout.split('\n').length - 1, 1,
+        `${context}: wrote more than the banner: ${JSON.stringify(started.stdout)}`);
+      assert.equal(await portIsReleased(boundPort), true,
+        `${context}: port ${boundPort} was still reachable after the process exited`);
+    } finally {
+      if (silent !== null) {
+        silent.destroy();
+      }
+      // Whatever the assertions found, no listener may outlive the run that started it.
+      if (!hasEnded(started.child)) {
+        started.child.kill('SIGKILL');
       }
     }
-  });
+  }
+}

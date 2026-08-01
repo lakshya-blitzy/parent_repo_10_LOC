@@ -230,21 +230,36 @@ function createServer() {
   return server;
 }
 
+// Loopback unless HOST names something, so the listener stays off external interfaces
+// by default; a padded value is trimmed to the address it names rather than handed to
+// the socket with its spaces. The mapping is a parameter, defaulting to the real
+// environment, because reading it and deciding what it means are separate concerns:
+// as a pure function of a mapping, every documented form is exercisable without a test
+// having to write into process.env, which every other module in the process shares.
+function resolveHost(env) {
+  const configured = ((env || process.env).HOST || '').trim();
+  return configured === '' ? DEFAULT_HOST : configured;
+}
+
 // An unset, blank, non-numeric or out-of-range PORT falls back to the default rather
-// than aborting start-up, while 0 is honoured as a request for an ephemeral port. The
-// signal handlers are installed here, not at module scope, so requiring registers none.
-function startServer() {
-  const configuredHost = (process.env.HOST || '').trim();
-  const host = configuredHost === '' ? DEFAULT_HOST : configuredHost;
-  const configuredPort = (process.env.PORT || '').trim();
+// than aborting start-up, while 0 is honoured as a request for an ephemeral port.
+// The mapping is a parameter for the reason given on resolveHost.
+function resolvePort(env) {
+  const configured = ((env || process.env).PORT || '').trim();
   // Strictly numeric before parsing, so a value such as '3000abc' is rejected
-  // outright rather than read as 3000.
-  const requestedPort = /^\d+$/.test(configuredPort)
-    ? Number.parseInt(configuredPort, 10)
+  // outright rather than read as 3000, and the signed forms '+3000' and '-0' with it:
+  // the siblings screen the same way, so the three resolve one value from one string.
+  const requested = /^\d+$/.test(configured)
+    ? Number.parseInt(configured, 10)
     : Number.NaN;
-  const port = Number.isInteger(requestedPort) && requestedPort <= 65535
-    ? requestedPort
-    : DEFAULT_PORT;
+  return Number.isInteger(requested) && requested <= 65535 ? requested : DEFAULT_PORT;
+}
+
+// Binds the address the environment resolves to and reports it. The signal handlers are
+// installed here, not at module scope, so requiring this module registers none.
+function startServer() {
+  const host = resolveHost();
+  const port = resolvePort();
 
   const server = createServer();
   // Left unhandled a bind failure prints the configured host, Node's own version and a
@@ -320,6 +335,8 @@ module.exports = {
   sendJson,
   refusedRequestStatus,
   createServer,
+  resolveHost,
+  resolvePort,
   startServer,
   HEALTH_PATH,
   ALLOWED_METHODS,
