@@ -84,21 +84,35 @@ promises a particular capitalisation.
 | `HEAD /health` | `200 OK`, the same headers (including the `Content-Length` a `GET` would return), and a zero-byte body |
 | Any other method on `/health` | `405 Method Not Allowed` with `Allow: GET, HEAD` and body `{"error":"Method Not Allowed"}` |
 | Any other path | `404 Not Found` with body `{"error":"Not Found"}` |
-| A request the endpoint cannot act on | `400 Bad Request` with body `{"error":"Bad Request"}` |
+| An HTTP/1.1 request with no `Host` field | `400 Bad Request` with body `{"error":"Bad Request"}` |
+| A request line no parser can read | `400 Bad Request` with body `{"error":"Bad Request"}` |
 
 All three error bodies are fixed strings derived from the status code alone. None
 of them ever repeats the path that was asked for or the method that was used, and
 none of them is ever HTML. An unrecognised method — `OPTIONS`, or a verb invented
 on the spot — is answered `405` with the same JSON envelope and the same `Allow`
 field, never `501`. A `CONNECT` is answered too — `405` on the route and `404`
-anywhere else — because silence is not one of this contract's answers.
+anywhere else — because silence is not one of this contract's answers. Only a
+`405` carries `Allow`: a `404` or a `400` would otherwise name a method that works
+on an address this endpoint does not serve, or on a message it never accepted.
 
-A request too malformed to be routed at all is answered `400 Bad Request` with
-body `{"error":"Bad Request"}`: an HTTP/1.1 request that carries no `Host` field,
-for instance, or a request line the parser refuses. Those answers are written
-inside the same contract as every other one — the same header fields, always
-`application/json`, and a body derived from the status code — so no path, method,
-header value or body from the request can reach a caller on any status path.
+RFC 9112 requires every HTTP/1.1 request to carry a `Host` field, and one that
+does not is answered `400 Bad Request` with body `{"error":"Bad Request"}` — the
+one malformed-request policy all three applications of this composition share,
+decided **before** the target and the method, so an unsupported method sent
+without the field is a `400` and not a `405`. HTTP/1.0 is held to no such rule and
+is served normally; a field that arrived empty was still sent, so it is served
+too; and the field name is matched case-insensitively, as RFC 9110 defines field
+names to compare. A request line no parser can read — a method token split by a
+space, an empty target — is answered `400` as well, and a request line the parser
+refuses for its method or its target is classified exactly as the router would
+have classified it, so the answer does not depend on which side of the parser the
+request stopped.
+
+Every one of those answers is written inside the same contract as every other one
+— the same header fields, always `application/json`, and a body derived from the
+status code — so no path, method, header value or body from the request can reach
+a caller on any status path.
 
 ### How the request target is matched
 
@@ -108,9 +122,11 @@ different target rather than another spelling of the route, and it is never
 re-normalised: a run of slashes is never collapsed and a dot segment is never
 resolved, so `/health/`, `/HEALTH`, `//health`, `///health` and `/a/../health` are
 different targets too, as is the absolute form `http://host/health`. Each of them
-is answered `404` with the fixed envelope. The path is decided before the method,
-so an unsupported method on a target that is not the route is answered `404`
-rather than `405`.
+is answered `404` with the fixed envelope. The decision order is `Host`, then
+path, then method, so an unsupported method on a target that is not the route is
+answered `404` rather than `405`, and either of them sent without a `Host` field is
+answered `400` rather than either. All three applications of this composition
+decide in that order.
 
 Point probes at the exact target `/health`, and note that a base URL already
 ending in `/` concatenated with `/health` produces `//health`, one of them.
@@ -255,8 +271,13 @@ with `# pass 5` and `# fail 0`. The five tests cover:
   on a later response;
 - **`HEAD /health`** — the `GET` header set with a zero-byte body, counted over a
   raw socket as well as through a client;
-- **every target that is not the route** — `404` for each of them, and `400` for
-  the requests the router never sees;
+- **every target that is not the route** — `404` for each of them, sent with each
+  of the methods the route rejects as well, because the target is judged first and
+  a `404` must advertise no `Allow`; `400` for every request the router never sees,
+  including one with no `Host` field, which is answered the same way whether the
+  parser accepted it or refused it; the two boundaries that must *not* be refused,
+  an empty `Host` value and a lower-case field name; and the exported classifier's
+  verdict on each of those packets, asserted directly as well as over a socket;
 - **every method the route rejects** — `405` with its `Allow` field, including a
   verb invented on the spot and a `CONNECT` that never reaches the router.
 

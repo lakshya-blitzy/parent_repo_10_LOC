@@ -660,6 +660,28 @@ function bypassCases(address) {
       absent: []
     },
     {
+      // The same missing field on a request Node's parser refuses before a request object
+      // exists. The classifier makes the check the router makes, and in the same order, so
+      // this is a 400 rather than the 405 the method alone would have earned - which is what
+      // the Python and Java siblings answer too.
+      name: 'an unsupported method with no Host field',
+      request: `FOO ${HEALTH_PATH} HTTP/1.1\r\n\r\n`,
+      status: 400,
+      statusLine: 'HTTP/1.1 400 Bad Request',
+      body: BAD_REQUEST_BODY,
+      allow: null,
+      absent: ['FOO']
+    },
+    {
+      name: 'an unsupported method on an unknown path with no Host field',
+      request: 'FOO /nope HTTP/1.1\r\n\r\n',
+      status: 400,
+      statusLine: 'HTTP/1.1 400 Bad Request',
+      body: BAD_REQUEST_BODY,
+      allow: null,
+      absent: ['FOO', 'nope']
+    },
+    {
       name: 'a method token split by a space',
       request: `GE T ${HEALTH_PATH} HTTP/1.1\r\nHost: ${authority}\r\n\r\n`,
       status: 400,
@@ -746,6 +768,31 @@ test('requests this endpoint does not serve are refused as JSON - 404 for an unk
       assert.ok(!text.toLowerCase().includes(requested.toLowerCase()),
         `${context}: the error body echoed the request path`);
       assert.ok(!text.includes('<'), `${context}: the error body was not JSON`);
+      // A 404 owes no Allow field and must not send one: naming a method that would have
+      // worked would be an answer about an address this endpoint does not serve.
+      assert.equal(headerValue(response, 'allow'), '', context);
+    }
+
+    // The same unknown paths with the methods the route refuses. The target is judged before
+    // the method, so a request that is wrong in both ways is answered 404 and not 405 - the
+    // precedence both siblings apply as well - and it still advertises nothing. POST and
+    // DELETE are routed; OPTIONS and the invented verb FOO are refused by Node's parser
+    // first, so this covers the router and the classifier with one matrix.
+    for (const path of NON_ROUTES) {
+      for (const method of REJECTED_METHODS) {
+        const context = `method ${method} on path ${path}`;
+        const { response, text } = await request(address.base + path, { method });
+        assert.equal(response.status, 404, context);
+        assert.equal(headerValue(response, 'allow'), '', context);
+        assert.equal(headerValue(response, 'content-type'), EXPECTED_MEDIA_TYPE, context);
+        assert.equal(headerValue(response, 'cache-control'), EXPECTED_CACHE_CONTROL,
+          context);
+        assert.equal(headerValue(response, 'content-length'),
+          String(Buffer.byteLength(text)), context);
+        assert.equal(text, NOT_FOUND_BODY, context);
+        assert.ok(!text.includes(method), `${context}: the body echoed the method`);
+        assert.ok(!text.includes('<'), `${context}: the body was not JSON`);
+      }
     }
 
     // The same refusal, for the shapes that never reach the router at all: a CONNECT whose
@@ -757,16 +804,56 @@ test('requests this endpoint does not serve are refused as JSON - 404 for an unk
       }
     }
 
+    // Only the absent field breaks the rule: a field that arrived empty was still sent, and
+    // the field name is matched as HTTP compares field names. Both are served, so the refusal
+    // above cannot be over-broad, and both are sent over a socket because no client library
+    // will omit or misspell the field for you. The third boundary - that the rule belongs to
+    // HTTP/1.1 alone - is asserted on the success path by the GET case above and again in the
+    // classifier table below, so it is not repeated here.
+    const authority = `${address.host}:${address.port}`;
+    for (const [name, packet] of [
+      ['an empty Host field',
+        `GET ${HEALTH_PATH} HTTP/1.1\r\nHost:\r\nConnection: close\r\n\r\n`],
+      ['a lower-case host field',
+        `GET ${HEALTH_PATH} HTTP/1.1\r\nhost: ${authority}\r\nConnection: close\r\n\r\n`]
+    ]) {
+      const wire = await rawSend(address, packet, name);
+      assert.ok(wire.head.startsWith('HTTP/1.1 200 OK'),
+        `${name} must still be served; status line was [${wire.head.split('\r\n')[0]}]`);
+      assert.equal(JSON.parse(wire.body.toString('utf8')).status, EXPECTED_STATUS, name);
+    }
+
     // The classifier those refusals are routed through, asserted directly as well: it is
-    // exported, so its verdicts can be checked without a socket, and these are the ones that
-    // separate a refusal the contract owes a 404 or a 405 from one it owes a 400.
-    assert.equal(app.refusedRequestStatus('HPE_INVALID_URL',
-      Buffer.from('GET /nope HTTP/1.1\r\n\r\n')), 404);
-    assert.equal(app.refusedRequestStatus('HPE_INVALID_METHOD',
-      Buffer.from(`GET ${HEALTH_PATH} HTTP/1.1\r\n\r\n`)), 400);
-    assert.equal(app.refusedRequestStatus('HPE_INVALID_CONSTANT',
-      Buffer.from(`FOO ${HEALTH_PATH} HTTP/1.1\r\n\r\n`)), 400);
-    assert.equal(app.refusedRequestStatus('HPE_INVALID_URL', Buffer.alloc(0)), 400);
+    // exported, so every verdict can be checked without a socket. A packet that carries the
+    // Host field is judged on its target and then its method; one that does not is a 400
+    // whatever they are, because the field is checked first - the order routeRequest applies.
+    const hostField = `Host: ${authority}\r\n`;
+    for (const [name, code, packet, expected] of [
+      ['a target that is not the route', 'HPE_INVALID_URL',
+        `GET /nope HTTP/1.1\r\n${hostField}\r\n`, 404],
+      ['the same target with no Host field', 'HPE_INVALID_URL',
+        'GET /nope HTTP/1.1\r\n\r\n', 400],
+      ['a method the parser accepts, so the refusal was something else',
+        'HPE_INVALID_METHOD', `GET ${HEALTH_PATH} HTTP/1.1\r\n${hostField}\r\n`, 400],
+      ['a refusal code that is neither the method nor the target',
+        'HPE_INVALID_CONSTANT', `FOO ${HEALTH_PATH} HTTP/1.1\r\n${hostField}\r\n`, 400],
+      ['an unsupported method on the route', 'HPE_INVALID_METHOD',
+        `FOO ${HEALTH_PATH} HTTP/1.1\r\n${hostField}\r\n`, 405],
+      ['the same method with no Host field', 'HPE_INVALID_METHOD',
+        `FOO ${HEALTH_PATH} HTTP/1.1\r\n\r\n`, 400],
+      ['an HTTP/1.0 request, which owes no Host field', 'HPE_INVALID_METHOD',
+        `FOO ${HEALTH_PATH} HTTP/1.0\r\n\r\n`, 405],
+      ['a lower-case host field', 'HPE_INVALID_METHOD',
+        `FOO ${HEALTH_PATH} HTTP/1.1\r\nhost: x\r\n\r\n`, 405],
+      ['a field that merely mentions the word host', 'HPE_INVALID_METHOD',
+        `FOO ${HEALTH_PATH} HTTP/1.1\r\nUser-Agent: host-probe\r\n\r\n`, 400],
+      ['a header block that never terminated, so its absence proves nothing',
+        'HPE_INVALID_METHOD', `FOO ${HEALTH_PATH} HTTP/1.1\r\nX-Probe: a\r\n`, 405],
+      ['an empty packet', 'HPE_INVALID_URL', '', 400]
+    ]) {
+      assert.equal(app.refusedRequestStatus(code, Buffer.from(packet, 'latin1')), expected,
+        `the classifier's verdict on ${name}`);
+    }
   });
 });
 
@@ -822,8 +909,15 @@ test('unsupported methods respond 405 and advertise the allowed methods',
           await assertRefusedInsideContract(address, shape);
         }
       }
+      // The verdict behind the raw exchange above, asserted through the exported classifier.
+      // The packet carries the Host field a client sends, because without it the answer is
+      // not a 405 at all: the field is checked before the method, here as in the router and
+      // in both siblings, so the second assertion is the contrast that pins that ordering.
+      const hostField = `Host: ${address.host}:${address.port}\r\n`;
       assert.equal(app.refusedRequestStatus('HPE_INVALID_METHOD',
-        Buffer.from(`FOO ${HEALTH_PATH} HTTP/1.1\r\n\r\n`)), 405);
+        Buffer.from(`FOO ${HEALTH_PATH} HTTP/1.1\r\n${hostField}\r\n`)), 405);
+      assert.equal(app.refusedRequestStatus('HPE_INVALID_METHOD',
+        Buffer.from(`FOO ${HEALTH_PATH} HTTP/1.1\r\n\r\n`)), 400);
     });
   });
 

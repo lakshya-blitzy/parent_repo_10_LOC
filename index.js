@@ -13,6 +13,12 @@ const DEFAULT_PORT = 3000;
 // unintelligible rather than scanned, so one oversized packet cannot drive a
 // large string comparison.
 const MAX_REQUEST_LINE_LENGTH = 8192;
+// The same bound for a refused packet's header block, set to Node's own default
+// maximum header size: a block longer than the parser would ever have accepted is
+// treated as out of view rather than scanned.
+const MAX_HEADER_BLOCK_LENGTH = 16384;
+// The only version whose messages must carry a Host field; HTTP/1.0 need not.
+const HTTP_1_1 = 'HTTP/1.1';
 // RFC 9110 token grammar, which is what separates an extension method the endpoint
 // should refuse politely from a request line that is simply not HTTP.
 const METHOD_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
@@ -135,6 +141,46 @@ function isRequestTarget(value) {
   return true;
 }
 
+// The field lines of a refused packet's header block, or null when the blank line that
+// terminates the block is not in view. Both terminators are looked for, because a client
+// that ends its lines with a bare LF still produces a block a parser would accept.
+// Bounded as MAX_HEADER_BLOCK_LENGTH describes, and read as latin1 for the reason given
+// on requestLineOf: a refused packet may contain any byte.
+function headerFieldsOf(rawPacket) {
+  if (!Buffer.isBuffer(rawPacket) && typeof rawPacket !== 'string') {
+    return null;
+  }
+  const packet = Buffer.isBuffer(rawPacket)
+    ? rawPacket.toString('latin1', 0, Math.min(rawPacket.length, MAX_HEADER_BLOCK_LENGTH))
+    : rawPacket.slice(0, MAX_HEADER_BLOCK_LENGTH);
+  const crlf = packet.indexOf('\r\n\r\n');
+  const lf = packet.indexOf('\n\n');
+  let terminator = crlf;
+  if (terminator < 0 || (lf >= 0 && lf < terminator)) {
+    terminator = lf;
+  }
+  if (terminator < 0) {
+    return null;
+  }
+  // The first line is the request line, so the fields are everything after it.
+  return packet.slice(0, terminator).split(/\r?\n/).slice(1);
+}
+
+// Whether a refused packet carried no Host field. Matched at the start of a line and
+// case-insensitively, so a value that merely mentions the word - `User-Agent: host-probe`
+// - is never taken for the field, and a folded continuation line, which begins with
+// whitespace, never is either. A packet whose header block is not in view answers false:
+// not seeing the field is not the same as knowing it was never sent.
+function lacksHostField(rawPacket) {
+  const fields = headerFieldsOf(rawPacket);
+  if (fields === null) {
+    return false;
+  }
+  return !fields.some(function (field) {
+    return /^host:/i.test(field);
+  });
+}
+
 // A refused request never becomes a req/res pair, but its packet still carries the
 // request line the router would have used, so classifying it here keeps one contract
 // across both paths. Any other refusal leaves the request malformed, so it stays a 400.
@@ -155,6 +201,13 @@ function refusedRequestStatus(code, rawPacket) {
   const target = parts[1];
   if (!METHOD_TOKEN.test(method) || !SUPPORTED_VERSION.test(parts[2])
     || !isRequestTarget(target)) {
+    return 400;
+  }
+  // Host before path before method, which is the order routeRequest applies, so a request
+  // wrong in more than one way is answered the same whether the parser accepted it or not -
+  // and the same way the Python and Java siblings answer it. RFC 9112 requires the field of
+  // every HTTP/1.1 message and of no HTTP/1.0 one.
+  if (parts[2] === HTTP_1_1 && lacksHostField(rawPacket)) {
     return 400;
   }
   // Stripped exactly as the router strips it and compared as it arrived: never
