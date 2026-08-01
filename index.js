@@ -50,10 +50,9 @@ function healthPayload() {
   };
 }
 
-// Buffer.byteLength so Content-Length counts bytes rather than UTF-16 code units;
-// no-store because a cached liveness answer would be worse than none; close because
-// the endpoint reads no request body, and a connection reused while unread bytes remain
-// lets them be parsed as the next request. Node suppresses the body of a HEAD itself.
+// Buffer.byteLength so Content-Length counts bytes rather than UTF-16 code units; no-store
+// because a cached liveness answer is worse than none; close because a connection reused while
+// unread bytes remain lets them be parsed as the next request. Node omits a HEAD body itself.
 function sendJson(res, status, body, extraHeaders) {
   const payload = JSON.stringify(body);
   const headers = {
@@ -67,28 +66,22 @@ function sendJson(res, status, body, extraHeaders) {
   res.end(payload);
 }
 
-// Whether a parsed request is an HTTP/1.1 message carrying no Host field, which RFC 9112
-// requires a server to answer with a 400 - and which it requires of no HTTP/1.0 message, so
-// only 1.1 is held to it. Node checks this itself, but its rejection answers with a chunked,
-// bodiless 400 written before any code here is reached - no Content-Type, no Content-Length,
-// no Cache-Control and no JSON - so the check is made here instead, with Node's own one turned
-// off at createServer. One predicate serves both paths that receive a parsed request, the
-// router and the CONNECT listener, so neither can drift from the other's ordering; the packet
-// counterpart for a request the parser refused outright is lacksHostField. A request whose
-// header map is missing entirely is not treated as one that omitted the field: an absent map
-// is not evidence about what was sent, and this predicate answers a question about the wire.
+// Node checks the Host field RFC 9112 requires of an HTTP/1.1 message, but its rejection is a
+// chunked, bodiless 400 written before any code here is reached, so the check is made here
+// instead with Node's own turned off at createServer. One predicate serves both paths that
+// receive a parsed request, so neither can drift from the other's ordering; lacksHostField is
+// the counterpart for a packet the parser refused. A missing header map answers false: an
+// absent map is not evidence about what was sent.
 function lacksHostHeader(req) {
   const fields = req.headers || {};
   return req.httpVersionMajor === 1 && req.httpVersionMinor === 1
     && fields.host === undefined;
 }
 
-// The single routing decision: Host first, then path, then method - the order the Python and
-// Java siblings apply, so a request that is wrong in more than one way is answered the same way
-// by all three. Every inbound entry point below dispatches through here or, where there is no
-// ServerResponse to write through, applies the same ordering against the same predicates.
-// Query and fragment are stripped as the siblings strip them; the error bodies are fixed
-// literals that echo nothing of the request.
+// The single routing decision: Host, then path, then method - the order the siblings apply, so a
+// request wrong in more than one way is answered the same way by all three. Every entry point
+// below dispatches through here, or applies the same ordering against the same predicates where
+// there is no ServerResponse to write through. The error bodies echo nothing of the request.
 function routeRequest(req, res) {
   if (lacksHostHeader(req)) {
     sendJson(res, 400, { error: 'Bad Request' });
@@ -112,12 +105,10 @@ function discardBody(req) {
   req.resume();
 }
 
-// Both `Expect` events land here, because the header changes nothing about what this
-// endpoint owes a caller: it reads no request body, so there is no expectation to meet.
-// Left to Node, `100-continue` would be answered with an interim response that invites
-// an upload before the route and the method have been looked at, and any other value
-// with a bare 417 the siblings never send. Routing instead sends one final response,
-// which RFC 9110 permits in place of the interim one.
+// Both `Expect` events land here: this endpoint reads no request body, so there is no
+// expectation to meet. Left to Node, `100-continue` invites an upload before the route has been
+// looked at and any other value gets a bare 417 the siblings never send. Routing instead sends
+// one final response, which RFC 9110 permits in place of the interim one.
 function handleExpect(req, res) {
   routeRequest(req, res);
   discardBody(req);
@@ -154,11 +145,9 @@ function isRequestTarget(value) {
   return true;
 }
 
-// The field lines of a refused packet's header block, or null when the blank line that
-// terminates the block is not in view. Both terminators are looked for, because a client
-// that ends its lines with a bare LF still produces a block a parser would accept.
-// Bounded as MAX_HEADER_BLOCK_LENGTH describes, and read as latin1 for the reason given
-// on requestLineOf: a refused packet may contain any byte.
+// The field lines of a refused packet's header block, or null when its terminating blank line is
+// not in view. Both terminators are looked for, because a client ending its lines with a bare LF
+// still produces a block a parser would accept. latin1 for the reason given on requestLineOf.
 function headerFieldsOf(rawPacket) {
   if (!Buffer.isBuffer(rawPacket) && typeof rawPacket !== 'string') {
     return null;
@@ -175,15 +164,13 @@ function headerFieldsOf(rawPacket) {
   if (terminator < 0) {
     return null;
   }
-  // The first line is the request line, so the fields are everything after it.
   return packet.slice(0, terminator).split(/\r?\n/).slice(1);
 }
 
-// Whether a refused packet carried no Host field. Matched at the start of a line and
-// case-insensitively, so a value that merely mentions the word - `User-Agent: host-probe`
-// - is never taken for the field, and a folded continuation line, which begins with
-// whitespace, never is either. A packet whose header block is not in view answers false:
-// not seeing the field is not the same as knowing it was never sent.
+// Matched at the start of a line and case-insensitively, so a value that merely mentions the
+// word - `User-Agent: host-probe` - is never taken for the field, and neither is a folded
+// continuation line. A packet whose header block is not in view answers false: not seeing the
+// field is not the same as knowing it was never sent.
 function lacksHostField(rawPacket) {
   const fields = headerFieldsOf(rawPacket);
   if (fields === null) {
@@ -216,10 +203,6 @@ function refusedRequestStatus(code, rawPacket) {
     || !isRequestTarget(target)) {
     return 400;
   }
-  // Host before path before method, which is the order routeRequest applies, so a request
-  // wrong in more than one way is answered the same whether the parser accepted it or not -
-  // and the same way the Python and Java siblings answer it. RFC 9112 requires the field of
-  // every HTTP/1.1 message and of no HTTP/1.0 one.
   if (parts[2] === HTTP_1_1 && lacksHostField(rawPacket)) {
     return 400;
   }
@@ -267,16 +250,12 @@ function handleClientError(error, socket) {
   sendRawJson(socket, refusedRequestStatus(error.code, error.rawPacket));
 }
 
-// A CONNECT request is taken out of the normal request pipeline by Node, which hands it to a
-// 'connect' listener and, when there is none, closes the socket without answering at all. Silence
-// is not one of this contract's answers, so the request is routed here instead - with the same
-// Host-then-target ordering, through the same socket-level writer a refused request uses. There is
-// no ServerResponse to write through on this path, and no body to serve either: CONNECT is never
-// GET or HEAD, so the route can only owe it a 405, and any other target a 404 - unless the request
-// is an HTTP/1.1 one with no Host, which is answered 400 before either is looked at, exactly as
-// routeRequest and refusedRequestStatus answer it. Being handed a request outside the normal
-// pipeline is not a reason to judge it by a different order. (An Upgrade request needs no
-// counterpart: Node leaves those in the normal pipeline, where routeRequest answers them.)
+// Node takes CONNECT out of the normal pipeline and, with no 'connect' listener, closes the
+// socket without answering at all. Silence is not one of this contract's answers, so the request
+// is routed here with the same Host-then-target ordering, through the socket-level writer a
+// refused request uses. CONNECT is never GET or HEAD, so the route can owe it only a 405, any
+// other target a 404, and an HTTP/1.1 message with no Host a 400 before either is looked at.
+// (Upgrade needs no counterpart: Node leaves those where routeRequest answers them.)
 function handleConnect(req, socket) {
   if (!socket || !socket.writable) {
     return;
@@ -293,9 +272,8 @@ function handleConnect(req, socket) {
 // listen on port 0. Every entry point Node offers for an inbound request is wired to
 // application code here, so no answer this listener produces is a framework default.
 function createServer() {
-  // requireHostHeader is turned off so that Node's own bodiless, chunked 400 cannot be written
-  // ahead of the router; lacksHostHeader makes the same check on both paths that receive a
-  // parsed request, and each answers it through this contract's own writer.
+  // requireHostHeader off so Node's own bodiless, chunked 400 cannot be written ahead of the
+  // router; lacksHostHeader makes the same check, answered through this contract's own writer.
   const server = http.createServer({ requireHostHeader: false }, routeRequest);
   server.on('clientError', handleClientError);
   server.on('checkContinue', handleExpect);
@@ -304,12 +282,10 @@ function createServer() {
   return server;
 }
 
-// Loopback unless HOST names something, so the listener stays off external interfaces
-// by default; a padded value is trimmed to the address it names rather than handed to
-// the socket with its spaces. The mapping is a parameter, defaulting to the real
-// environment, because reading it and deciding what it means are separate concerns:
-// as a pure function of a mapping, every documented form is exercisable without a test
-// having to write into process.env, which every other module in the process shares.
+// Loopback unless HOST names something, so the listener stays off external interfaces by
+// default, and a padded value is trimmed rather than handed to the socket with its spaces. The
+// mapping is a parameter so the decision is a pure function of it: every documented form is
+// exercisable without a test writing into process.env, which the whole process shares.
 function resolveHost(env) {
   const configured = ((env || process.env).HOST || '').trim();
   return configured === '' ? DEFAULT_HOST : configured;
@@ -345,8 +321,6 @@ function startServer() {
     process.exitCode = 1;
   });
   server.listen(port, host, function () {
-    // The port is read back from the running server so an ephemeral bind
-    // (PORT=0) reports the port actually assigned rather than the one requested.
     const boundPort = server.address().port;
     console.log(`${pkg.name} ${pkg.version} health endpoint listening on `
       + `http://${host}:${boundPort}${HEALTH_PATH}`);
@@ -360,22 +334,17 @@ function startServer() {
       return;
     }
     closing = true;
-    // Stop accepting, then exit as soon as the last connection has gone.
     server.close(function () {
       process.exit(0);
     });
-    // A connection with no request in flight is released first, because close() would otherwise
-    // wait for it.
     if (typeof server.closeIdleConnections === 'function') {
       server.closeIdleConnections();
     }
-    // That is not enough on its own: a caller that opened a socket and sent nothing - which is
-    // exactly what a load-balancer TCP probe and a port scanner do, and this endpoint attracts
-    // both - is not counted as idle, so close() would wait on it indefinitely and the process
-    // would outlive its signal until the peer hung up or SIGKILL arrived. Destroying every
-    // remaining connection after a short grace window bounds the exit while still letting a
-    // response already being written finish. unref() so the timer itself never keeps the loop
-    // alive once there is nothing left to wait for.
+    // Releasing idle connections is not enough on its own: a caller that opened a socket and sent
+    // nothing - exactly what a load-balancer probe and a port scanner do - counts as neither idle
+    // nor in flight, so close() would wait on it indefinitely and the process would outlive its
+    // signal. Destroying what remains after a short grace window bounds the exit while letting a
+    // response already being written finish. unref() so the timer never keeps the loop alive.
     const escalation = setTimeout(function () {
       if (typeof server.closeAllConnections === 'function') {
         server.closeAllConnections();
